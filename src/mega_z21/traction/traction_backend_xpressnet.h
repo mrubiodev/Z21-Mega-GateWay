@@ -52,6 +52,23 @@
  *      f0/f1/f2/f3 que entrega notifyLokAll (mismo origen X-Bus para
  *      ambos protocolos) — ver conversión en el .cpp, no debería hacer
  *      falta tocarla, pero se deja documentada por si acaso.
+ *   4) ACCESORIOS (agujas/señales, ver PDF sección 5): setTrntPos(Adr_
+ *      High, Adr_Low, Pos) de la librería espera 'Pos' en el mismo
+ *      formato de nibble bajo que ya usaba el proyecto de referencia
+ *      tkoning/Z21-arduino para reenviar LAN_X_SET_TURNOUT tal cual
+ *      (Z21_EMULATOR_SPEC.md sección 13): Pos = (A<<3)|P, es decir el DB2
+ *      de Z21 (10Q0A00P) con el bit Q descartado y desplazado a nibble
+ *      bajo — se asume que XpressNetClass reconstruye el mismo paquete
+ *      X-Bus "Weichenbefehl" (0x52) a partir de ahí. El callback
+ *      notifyTrnt(Adr_High, Adr_Low, Pos) que entrega la respuesta del
+ *      bus se asume simétrico: se asume que su 'Pos' trae directamente
+ *      el campo ZZ de LAN_X_TURNOUT_INFO en los 2 bits bajos (00=no
+ *      conmutada, 01/10=salida1/2, 11=inválida) — NINGUNA de las dos
+ *      asunciones está confirmada contra hardware real todavía (no hay
+ *      forma de compilar/probar esta librería de terceros desde este
+ *      entorno de trabajo); si al probar con la MultiMaus la posición
+ *      informada no coincide con la aguja real, revisar primero aquí
+ *      (setTurnout()/onTrnt() en el .cpp).
  */
 #ifndef TRACTION_BACKEND_XPRESSNET_H
 #define TRACTION_BACKEND_XPRESSNET_H
@@ -69,6 +86,7 @@
 
 #include "traction_backend.h"
 #include "loco_state_store.h"
+#include "accessory_state_store.h"
 
 #ifndef TRACTION_XPRESSNET_MY_ADDRESS
 #define TRACTION_XPRESSNET_MY_ADDRESS 30 // 1-31, único en el bus (ver docs/Z21_EMULATOR_SPEC.md sección 12)
@@ -96,6 +114,10 @@ public:
   void requestLocoRefresh(uint16_t addr) override;
   const LocoState *getLocoState(uint16_t addr) override;
 
+  void setTurnout(uint16_t addr, bool output, bool activate) override;
+  void requestTurnoutRefresh(uint16_t addr) override;
+  const AccessoryState *getTurnoutState(uint16_t addr) override;
+
   // --- Puente hacia los callbacks "weak" de la librería (ver .cpp) ---
   // Públicos porque los invocan funciones libres de espacio de nombres
   // global (notifyXNetStatus, notifyLokAll, ...), NO forman parte del
@@ -105,10 +127,12 @@ public:
   void onLokAll(uint8_t adrHigh, uint8_t adrLow, bool busy, uint8_t steps,
                 uint8_t speed, uint8_t direction, uint8_t f0, uint8_t f1,
                 uint8_t f2, uint8_t f3, bool req);
+  void onTrnt(uint8_t adrHigh, uint8_t adrLow, uint8_t pos);
 
 private:
   TrackState track_;
   LocoStateStore locos_;
+  AccessoryStateStore accessories_;
 };
 
 // Única instancia posible: la librería XpressNetClass usa un puntero

@@ -19,6 +19,7 @@
 
 #include "traction_backend.h"
 #include "loco_state_store.h"
+#include "accessory_state_store.h"
 
 class DummyTractionBackend : public ITractionBackend {
 public:
@@ -85,6 +86,26 @@ public:
     return locos_.findOrAlloc(addr);
   }
 
+  void setTurnout(uint16_t addr, bool output, bool activate) override {
+    AccessoryState *acc = accessories_.findOrAlloc(addr);
+    // Sin bus físico detrás: se simula que la salida activada "prende" al
+    // momento (A=1) y el estado se queda tal cual al soltar el pulso
+    // (A=0) — igual que haría un decodificador de accesorios biestable
+    // real, que no vuelve a NotSwitched solo porque se corte la
+    // alimentación de la bobina.
+    if (activate) {
+      acc->position = output ? AccessoryPosition::Output2 : AccessoryPosition::Output1;
+    }
+  }
+
+  void requestTurnoutRefresh(uint16_t addr) override {
+    (void)addr; // no-op: el estado dummy ya está siempre al día
+  }
+
+  const AccessoryState *getTurnoutState(uint16_t addr) override {
+    return accessories_.findOrAlloc(addr);
+  }
+
 private:
   // Aplica un cambio de una única función (LAN_X_SET_LOCO_FUNCTION). F0-F4
   // usan el orden de bits especial de DB4 (ver traction_types.h); F5-F28
@@ -119,6 +140,7 @@ private:
 
   TrackState track_;
   LocoStateStore locos_;
+  AccessoryStateStore accessories_;
 };
 
 #endif // TRACTION_BACKEND_DUMMY_H

@@ -36,6 +36,14 @@
 #define LAN_GET_COMMUNICATION_INFO 0x12
 
 #define LAN_CAN_DETECTOR 0xC4
+
+// Accesorios (agujas/señales de 2 aspectos/desacopladores/descarriladores
+// biestables) — PDF oficial sección 5 "Switching". Mismo XHeader 0x43
+// para la petición (5.1) y la respuesta (5.3): se distinguen por
+// DataLen/DB2, no por el XHeader.
+#define LAN_X_GET_TURNOUT_INFO 0x43
+#define LAN_X_TURNOUT_INFO 0x43
+#define LAN_X_SET_TURNOUT 0x53
 // Headers de la secuencia de conexión/login (PDF oficial, secciones
 // 2.16-2.19). IMPORTANTE: el propio PDF dice literalmente que "el login
 // se hace de forma implícita con el primer comando del cliente (p.ej.
@@ -127,7 +135,7 @@
 // significativos en cada sketch.
 // -----------------------------------------------------------------------
 #define MEGA_FW_VERSION_MAJOR 0
-#define MEGA_FW_VERSION_MINOR 8
+#define MEGA_FW_VERSION_MINOR 9
 #define ESP_FW_VERSION_MAJOR 0
 #define ESP_FW_VERSION_MINOR 7
 
@@ -195,5 +203,16 @@
 //     solo en el log. No afecta a esp8266_wifi.ino ni al formato NetInfo
 //     por cable (ya llevaba la MAC desde v0.9, solo que el Mega no la
 //     pintaba todavia).
+//   - v0.11 (2026-08-04): MEGA_FW_VERSION_MINOR 8->9. Nuevas constantes
+//     LAN_X_GET_TURNOUT_INFO/LAN_X_TURNOUT_INFO/LAN_X_SET_TURNOUT (PDF
+//     seccion 5, "Switching") -- primer soporte de accesorios (agujas,
+//     senales de 2 aspectos, desacopladores, descarriladores biestables:
+//     todos son el mismo decodificador de accesorios DCC de 2 salidas a
+//     nivel de protocolo Z21). Nuevo AccessoryState en traction_types.h,
+//     nuevos metodos setTurnout/requestTurnoutRefresh/getTurnoutState en
+//     ITractionBackend, implementados en ambos backends (Dummy y
+//     XpressNet). Senales de mas de 2 aspectos (LAN_X_SET_EXT_ACCESSORY,
+//     PDF seccion 5.4) quedan fuera todavia. No afecta a esp8266_wifi.ino
+//     (el ESP sigue sin interpretar el contenido Z21).
 
 #endif // Z21_PROTOCOL_H

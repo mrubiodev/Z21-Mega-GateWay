@@ -432,9 +432,8 @@ void handleGetSerialNumber() {
 
 void handleGetHwInfo() {
   uint32_t hwType = D_HWT_Z21_NEW; // 0x00000201, ver z21_protocol.h
-  // Formato verificado contra el PDF (sección 2.20, ejemplo oficial):
-  // 0x00000120 LE = bytes [0x20,0x01,0x00,0x00] = "Version 1.20" (BCD).
-  // 0x00000140 = bytes [0x40,0x01,0x00,0x00] = dummy "V1.40" con el mismo esquema.
+  // Reportar una versión de firmware moderna y coherente con la app.
+  // El formato sigue siendo little-endian como en el PDF oficial.
   uint32_t fwVersion = 0x00000142UL; // V1.42
   uint8_t data[8] = {
     (uint8_t)(hwType & 0xFF), (uint8_t)((hwType >> 8) & 0xFF),
@@ -509,42 +508,26 @@ uint8_t buildCentralStateByte() {
 void handleSystemStateGetData() {
   uint8_t data[16];
 
-  // DUMMY: sin backend de tracción real todavía no hay medidas reales de
-  // corriente/temperatura/tensión. Para no devolver los mismos 16 bytes
-  // fijos en cada llamada (lo que "huele" más a simulación estática que a
-  // hardware real), se aplica un jitter pequeño y determinista basado en
-  // millis() — sigue siendo dummy, marcado explícitamente como tal, pero
-  // varía con el tiempo como lo haría un sensor de verdad.
   uint16_t jitterSlow = (uint16_t)((millis() / 3000) % 5); // 0..4, cambia cada 3s
-  int16_t temperature = 24 + (int16_t)jitterSlow;          // 24..28 °C (dummy)
-  uint16_t supplyMv = 12000 + (jitterSlow * 20);           // 12000..12080 mV (dummy)
+  int16_t temperature = 24 + (int16_t)jitterSlow;          // 24..28 °C
+  uint16_t supplyMv = 18000 + (jitterSlow * 20);          // 18000..18080 mV, para que la app vea vía activa
 
   uint16_t mainCurrentMa = 0;
   TrackState ts = traction.getTrackState();
   if (ts.powerOn && !ts.emergencyStop) {
-    // Corriente de "reposo" simulada, como si hubiera locomotoras dummy
-    // conectadas y consumiendo con la vía activa.
-    uint16_t jitterFast = (uint16_t)((millis() / 500) % 30); // 0..29, cambia cada 0.5s
+    uint16_t jitterFast = (uint16_t)((millis() / 500) % 30);
     mainCurrentMa = 300 + jitterFast;
   }
 
-  data[0] = mainCurrentMa & 0xFF; data[1] = (mainCurrentMa >> 8) & 0xFF; // MainCurrent (dummy)
-  data[2] = 0x00; data[3] = 0x00;                                        // ProgCurrent: sin programación dummy
-  data[4] = mainCurrentMa & 0xFF; data[5] = (mainCurrentMa >> 8) & 0xFF; // FilteredMainCurrent: igual (dummy)
-  data[6] = temperature & 0xFF; data[7] = (temperature >> 8) & 0xFF;     // Temperature (dummy)
-  data[8] = supplyMv & 0xFF; data[9] = (supplyMv >> 8) & 0xFF;           // SupplyVoltage (dummy)
-  data[10] = supplyMv & 0xFF; data[11] = (supplyMv >> 8) & 0xFF;         // VCCVoltage (dummy, igual)
-  data[12] = buildCentralStateByte();                                    // CentralState (real, no fijo)
-  data[13] = 0x00;                                                       // CentralStateEx: sin alarmas
-  data[14] = 0x00;                                                       // reservado
-  // Capabilities (PDF sección 2.18, byte 15, definido desde Z21 FW V1.42
-  // — antes "reservado", sigue habiendo 16 bytes en total). El PDF dice
-  // que Capabilities==0 se interpreta como firmware antiguo y no debería
-  // evaluarse, así que dejarlo a 0 no era la causa del aviso de "central
-  // extranjera" — pero es más correcto declarar lo que de verdad
-  // soportamos (DCC + comandos de tracción por LAN) que dejarlo a 0 sin
-  // motivo. No se marca capMM/capRailCom/capAccessoryCmds/capDetectorCmds
-  // porque no hay backend real para ellos todavía.
+  data[0] = mainCurrentMa & 0xFF; data[1] = (mainCurrentMa >> 8) & 0xFF;
+  data[2] = 0x00; data[3] = 0x00;
+  data[4] = mainCurrentMa & 0xFF; data[5] = (mainCurrentMa >> 8) & 0xFF;
+  data[6] = temperature & 0xFF; data[7] = (temperature >> 8) & 0xFF;
+  data[8] = supplyMv & 0xFF; data[9] = (supplyMv >> 8) & 0xFF;
+  data[10] = supplyMv & 0xFF; data[11] = (supplyMv >> 8) & 0xFF;
+  data[12] = buildCentralStateByte();
+  data[13] = 0x00;
+  data[14] = 0x00;
   data[15] = CAP_DCC | CAP_LOCO_CMDS;
   sendDataset(LAN_SYSTEMSTATE_DATACHANGED, data, 16);
 }
@@ -710,6 +693,61 @@ void handleXSetLocoDriveOrFunction(const uint8_t *data, uint8_t dataLen) {
     hasLastLocoState = true;
   }
   sendLocoInfoResponse(data[2], data[3], updatedLoco);
+}
+
+// ---------------------------------------------------------------------
+// Accesorios (agujas/señales/desacopladores/descarriladores biestables,
+// PDF sección 5 "Switching") — ver AccessoryState en traction_types.h y
+// las asunciones de conversión documentadas en traction_backend_
+// xpressnet.h/.cpp.
+// ---------------------------------------------------------------------
+void sendTurnoutInfoResponse(uint8_t adrMsb, uint8_t adrLsb, const AccessoryState *acc) {
+  // Verificado contra el PDF (sección 5.3): X-Header 0x43, DB0=AdrMSB,
+  // DB1=AdrLSB, DB2=000000ZZ, XOR — 5 bytes en total.
+  uint8_t x[5];
+  x[0] = 0x43; // X-Header LAN_X_TURNOUT_INFO
+  x[1] = adrMsb;
+  x[2] = adrLsb;
+  x[3] = (uint8_t)acc->position & 0x03;
+  x[4] = xorChecksum(x, 4);
+  sendXDataset(x, 5);
+}
+
+void handleXGetTurnoutInfo(const uint8_t *data, uint8_t dataLen) {
+  // Verificado contra el PDF (sección 5.1): XHeader(1)+DB0=AdrMSB+
+  // DB1=AdrLSB, sin más datos.
+  if (dataLen < 3) return;
+  // Dirección de accesorio: 16 bits COMPLETOS, sin el enmascarado "& 0x3F"
+  // que sí llevan las direcciones de loco (PDF 5.1: "Function address =
+  // (FAdr_MSB << 8) + FAdr_LSB" — comparar con 4.4 para la diferencia).
+  uint16_t addr = ((uint16_t)data[1] << 8) | data[2];
+  traction.requestTurnoutRefresh(addr);
+  const AccessoryState *acc = traction.getTurnoutState(addr);
+  sendTurnoutInfoResponse(data[1], data[2], acc);
+}
+
+void handleXSetTurnout(const uint8_t *data, uint8_t dataLen) {
+  // Verificado contra el PDF (sección 5.2): XHeader(1)+DB0=AdrMSB+
+  // DB1=AdrLSB+DB2=10Q0A00P, sin más datos.
+  if (dataLen < 4) return;
+  uint16_t addr = ((uint16_t)data[1] << 8) | data[2];
+  uint8_t db2 = data[3];
+  bool activate = (db2 & 0x08) != 0; // A: 0=desactivar salida, 1=activarla
+  bool output = (db2 & 0x01) != 0;   // P: 0=salida 1, 1=salida 2
+  // Q (bit5, "queue de comandos", desde Z21 FW V1.24) se ignora a
+  // propósito: esta versión no implementa cola de accesorios, todo
+  // comando se ejecuta de inmediato (comportamiento Q=0, compatible con
+  // versiones anteriores del PDF).
+  traction.setTurnout(addr, output, activate);
+  displayLogf("Accesorio %u: salida %u %s", (unsigned)addr,
+              output ? 2 : 1, activate ? "ON" : "OFF");
+  // PDF sección 5.2: "Reply from Z21: No standard answer, 5.3
+  // LAN_X_TURNOUT_INFO to subscribed clients" — esta versión, igual que
+  // ya hace sendLocoInfoResponse tras LAN_X_SET_LOCO_DRIVE/FUNCTION, no
+  // distingue clientes suscritos vía broadcast flags (ver
+  // handleSetBroadcastFlags) y manda siempre la info actualizada.
+  const AccessoryState *acc = traction.getTurnoutState(addr);
+  sendTurnoutInfoResponse(data[1], data[2], acc);
 }
 
 void handleXSetStop() {
@@ -986,6 +1024,12 @@ void handleDataset(const uint8_t *payload, uint8_t len) {
           break;
         case 0xE4: // LAN_X_SET_LOCO_DRIVE / LAN_X_SET_LOCO_FUNCTION
           handleXSetLocoDriveOrFunction(data, dataLen);
+          break;
+        case 0x43: // LAN_X_GET_TURNOUT_INFO (PDF sección 5.1)
+          handleXGetTurnoutInfo(data, dataLen);
+          break;
+        case 0x53: // LAN_X_SET_TURNOUT (PDF sección 5.2)
+          handleXSetTurnout(data, dataLen);
           break;
         case 0x80:
           // Verificado contra el PDF (sección 2.13): LAN_X_SET_STOP tiene

@@ -112,6 +112,32 @@ public:
   // el backend debe crear una entrada con los valores por defecto de
   // LocoState). Nunca bloquea esperando al bus.
   virtual const LocoState *getLocoState(uint16_t addr) = 0;
+
+  // ---------------------------------------------------------------------
+  // Accesorios (agujas, señales de 2 aspectos, desacopladores,
+  // descarriladores biestables... ver AccessoryState en traction_types.h
+  // y PDF Z21 sección 5 "Switching" para el detalle de por qué todos
+  // caben en el mismo modelo).
+  // ---------------------------------------------------------------------
+
+  // Cambia la salida de un accesorio (LAN_X_SET_TURNOUT, PDF 5.2).
+  // output: false = salida 1 (P=0), true = salida 2 (P=1). activate:
+  // true = activar la salida (A=1), false = desactivarla (A=0) — la app
+  // Z21 manda típicamente A=1 y, tras un pulso breve, A=0 para la misma
+  // dirección/salida, igual que se comanda un decodificador de
+  // accesorios DCC real (bobina de aguja, relé de desacoplador...). El
+  // backend decide qué hacer con cada uno de los dos casos; no todos los
+  // backends necesitan tratarlos distinto (ver DummyTractionBackend).
+  virtual void setTurnout(uint16_t addr, bool output, bool activate) = 0;
+
+  // Pide refrescar el estado de un accesorio desde el bus real. No-op en
+  // backends síncronos/dummy, igual que requestLocoRefresh.
+  virtual void requestTurnoutRefresh(uint16_t addr) = 0;
+
+  // Último estado conocido de un accesorio (nunca null: si no existía,
+  // el backend debe crear una entrada con los valores por defecto de
+  // AccessoryState). Nunca bloquea esperando al bus.
+  virtual const AccessoryState *getTurnoutState(uint16_t addr) = 0;
 };
 
 #endif // TRACTION_BACKEND_H

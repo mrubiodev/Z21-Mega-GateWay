@@ -72,4 +72,37 @@ struct TrackState {
   bool serviceModeActive = false;
 };
 
+// Nº de accesorios (agujas, señales de 2 aspectos, desacopladores,
+// descarriladores biestables...) que se recuerdan en RAM simultáneamente.
+// El PDF oficial (sección 5, "Switching") es explícito en que el mismo
+// comando sirve para "una aguja (o cualquier función de conmutación)" —
+// no hay un tipo "aguja" distinto de "señal" a nivel de protocolo Z21
+// LAN_X_GET/SET_TURNOUT, ambos son un decodificador de accesorios DCC de
+// 2 salidas. Señales de más de 2 aspectos necesitan LAN_X_SET_EXT_
+// ACCESSORY (PDF sección 5.4) — TODO, no implementado todavía (ver
+// AGENT.md).
+#define MAX_TRACKED_ACCESSORIES 16
+
+// ZZ de LAN_X_TURNOUT_INFO (PDF sección 5.3): posición conocida de un
+// accesorio. NotSwitched es el valor inicial antes de que llegue ningún
+// comando o confirmación del bus para esa dirección.
+enum class AccessoryPosition : uint8_t {
+  NotSwitched = 0b00, // aún no se ha conmutado desde el arranque
+  Output1 = 0b01,      // conmutado a la salida 1 (P=0 en LAN_X_SET_TURNOUT)
+  Output2 = 0b10,      // conmutado a la salida 2 (P=1)
+  Invalid = 0b11        // posición inválida (p.ej. ambas salidas activas a la vez)
+};
+
+// Estado de UN accesorio, en el formato que usa el protocolo Z21 LAN_X
+// (ver PDF 5.1-5.3). address usa el rango completo de 16 bits sin
+// enmascarar (a diferencia de LocoState::address, ver PDF sección 5.1:
+// "Function address = (FAdr_MSB << 8) + FAdr_LSB", sin el "& 0x3F" que sí
+// lleva la dirección de loco en 4.4) — por eso 0 SÍ es una dirección de
+// accesorio válida, y el "slot libre" se marca con 0xFFFF en vez de 0
+// (ver accessory_state_store.h).
+struct AccessoryState {
+  uint16_t address = 0xFFFF; // 0xFFFF = slot libre
+  AccessoryPosition position = AccessoryPosition::NotSwitched;
+};
+
 #endif // TRACTION_TYPES_H

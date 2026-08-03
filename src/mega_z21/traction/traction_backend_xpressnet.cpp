@@ -143,6 +143,28 @@ const LocoState *XpressNetTractionBackend::getLocoState(uint16_t addr) {
   return locos_.findOrAlloc(addr);
 }
 
+void XpressNetTractionBackend::setTurnout(uint16_t addr, bool output, bool activate) {
+  uint8_t adrHigh = (uint8_t)((addr >> 8) & 0xFF); // sin enmascarar: dirección
+  uint8_t adrLow = (uint8_t)(addr & 0xFF);          // de accesorio, no de loco
+  // Formato de 'Pos' — ver punto 4 de "ASUNCIONES A VALIDAR" en el .h.
+  uint8_t pos = (uint8_t)((activate ? 0x08 : 0x00) | (output ? 0x01 : 0x00));
+  XpressNet.setTrntPos(adrHigh, adrLow, pos);
+  // No se actualiza accessories_ aquí a ciegas, igual que setLocoDrive no
+  // actualiza locos_: el estado confirmado llega por notifyTrnt/onTrnt
+  // cuando el bus responde de verdad. getTurnoutState() mientras tanto
+  // sigue devolviendo el último valor conocido.
+}
+
+void XpressNetTractionBackend::requestTurnoutRefresh(uint16_t addr) {
+  uint8_t adrHigh = (uint8_t)((addr >> 8) & 0xFF);
+  uint8_t adrLow = (uint8_t)(addr & 0xFF);
+  XpressNet.getTrntInfo(adrHigh, adrLow);
+}
+
+const AccessoryState *XpressNetTractionBackend::getTurnoutState(uint16_t addr) {
+  return accessories_.findOrAlloc(addr);
+}
+
 void XpressNetTractionBackend::onXNetStatus(uint8_t ledState) {
   (void)ledState; // TODO: llevar esto al log de pantalla cuando se conecte
                   // el RS485 real (displayLogf vive en mega_z21.ino, no aquí
@@ -176,6 +198,12 @@ void XpressNetTractionBackend::onLokAll(uint8_t adrHigh, uint8_t adrLow, bool bu
   loco->pendingBusConfirmation = false;
 }
 
+void XpressNetTractionBackend::onTrnt(uint8_t adrHigh, uint8_t adrLow, uint8_t pos) {
+  uint16_t addr = ((uint16_t)adrHigh << 8) | adrLow; // sin enmascarar, ver setTurnout()
+  AccessoryState *acc = accessories_.findOrAlloc(addr);
+  acc->position = static_cast<AccessoryPosition>(pos & 0x03);
+}
+
 // ---------------------------------------------------------------------
 // Callbacks "weak" de la librería XpressNetClass (espacio de nombres
 // global, ver XpressNet.h) — solo pueden existir UNA vez en todo el
@@ -198,6 +226,12 @@ void notifyLokAll(uint8_t Adr_High, uint8_t Adr_Low, boolean Busy, uint8_t Steps
   if (g_activeXpressNetBackend) {
     g_activeXpressNetBackend->onLokAll(Adr_High, Adr_Low, Busy, Steps, Speed,
                                         Direction, F0, F1, F2, F3, Req);
+  }
+}
+
+void notifyTrnt(uint8_t Adr_High, uint8_t Adr_Low, uint8_t Pos) {
+  if (g_activeXpressNetBackend) {
+    g_activeXpressNetBackend->onTrnt(Adr_High, Adr_Low, Pos);
   }
 }
 
