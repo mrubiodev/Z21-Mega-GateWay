@@ -276,6 +276,14 @@ unsigned long apModeSinceMs = 0; // 0 = no estamos en AP; si no, marca de tiempo
 WiFiUDP z21Udp;
 ESP8266WebServer webServer(80);
 
+// Buffer temporal para el archivo subido en /restore (ver handleRestoreUpload()
+// / handleRestoreDone() mas abajo) -- un backup nuestro son unas pocas lineas
+// de JSON, asi que un limite de RESTORE_MAX_UPLOAD_BYTES generoso evita que un
+// archivo subido por error (o con mala intencion) llene la RAM del ESP.
+#define RESTORE_MAX_UPLOAD_BYTES 4096
+String restoreUploadBuffer;
+bool restoreUploadTooBig = false;
+
 // Recuerda de qué IP/puerto vino el último datagrama UDP, para poder
 // reenviar hacia el cliente correcto la respuesta que llegue del Mega.
 IPAddress lastClientIP;
@@ -1165,6 +1173,187 @@ void handleScan() {
   webServer.send(200, "application/json", json);
 }
 
+// ---------------------------------------------------------------------
+// Backup / Restore de la configuracion (redes WiFi, credenciales del
+// portal, MAC personalizada) -- ver /backup y /restore mas abajo.
+//
+// El JSON se genera y se lee a mano (sin libreria tipo ArduinoJson) por
+// el mismo motivo que /scan: es un formato PLANO y controlado enteramente
+// por nosotros (lo generamos y lo consumimos los dos), asi que no hace
+// falta un parser JSON general -- basta con buscar cada "clave":"valor"
+// literal. Si el dia de manana el formato se complica (anidado, arrays
+// variables) esto dejaria de ser suficiente y tocaria plantearse una
+// libreria de verdad.
+// ---------------------------------------------------------------------
+
+// Busca "key":"valor" en json y copia valor (sin comillas, con \" y \\
+// des-escapados) en outBuf. Devuelve false si la clave no aparece.
+bool jsonGetString(const String &json, const char *key, char *outBuf, size_t outBufLen) {
+  String pattern = "\"" + String(key) + "\":\"";
+  int start = json.indexOf(pattern);
+  if (start < 0) return false;
+  start += pattern.length();
+
+  size_t outIdx = 0;
+  for (int i = start; i < (int)json.length() && outIdx < outBufLen - 1; i++) {
+    char c = json[i];
+    if (c == '"') break; // fin del valor
+    if (c == '\\' && i + 1 < (int)json.length()) {
+      i++;
+      c = json[i]; // \" -> ", \\ -> \ (no hay otros escapes en lo que generamos nosotros)
+    }
+    outBuf[outIdx++] = c;
+  }
+  outBuf[outIdx] = '\0';
+  return true;
+}
+
+// Busca "key":true o "key":false. Si la clave no aparece, devuelve defaultVal.
+bool jsonGetBool(const String &json, const char *key, bool defaultVal) {
+  String pattern = "\"" + String(key) + "\":";
+  int start = json.indexOf(pattern);
+  if (start < 0) return defaultVal;
+  start += pattern.length();
+  return json.startsWith("true", start);
+}
+
+// Aplica un backup ya leido en memoria a las variables de config en RAM
+// (cfgSSID/cfgPass/cfgWebUser/cfgWebPass/cfgMacAddr). NO llama a
+// saveConfig() -- eso lo decide quien la llama, para poder validar antes
+// de comprometerse a escribir en EEPROM y reiniciar.
+//
+// Campos ausentes en el JSON se dejan tal cual estaban (igual que en
+// handleSave(): un campo que no llega no borra lo que ya habia). Solo
+// hace falta que aparezca al menos un SSID para considerar el backup
+// valido -- si no, lo mas probable es que sea un archivo equivocado.
+bool applyBackupJson(const String &json) {
+  if (json.indexOf("\"formatVersion\":1") < 0) {
+    evLogfL(LOG_LVL_ERROR, "[CFG] Restore: falta o no coincide \"formatVersion\":1 -- se ignora");
+    return false;
+  }
+
+  bool anyNetworkFound = false;
+  char tmpSsid[EEPROM_ADDR_SSID_LEN + 1];
+  char tmpPass[EEPROM_ADDR_PASS_LEN + 1];
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    String ssidKey = "ssid" + String(i + 1);
+    String passKey = "pass" + String(i + 1);
+    if (jsonGetString(json, ssidKey.c_str(), tmpSsid, sizeof(tmpSsid))) {
+      memcpy(cfgSSID[i], tmpSsid, sizeof(tmpSsid));
+      if (strlen(tmpSsid) > 0) anyNetworkFound = true;
+    }
+    if (jsonGetString(json, passKey.c_str(), tmpPass, sizeof(tmpPass))) {
+      memcpy(cfgPass[i], tmpPass, sizeof(tmpPass));
+    }
+  }
+
+  char tmpUser[EEPROM_ADDR_WEBUSER_LEN + 1];
+  char tmpWebPass[EEPROM_ADDR_WEBPASS_LEN + 1];
+  if (jsonGetString(json, "webUser", tmpUser, sizeof(tmpUser)) && strlen(tmpUser) > 0) {
+    memcpy(cfgWebUser, tmpUser, sizeof(tmpUser));
+  }
+  if (jsonGetString(json, "webPass", tmpWebPass, sizeof(tmpWebPass)) && strlen(tmpWebPass) > 0) {
+    memcpy(cfgWebPass, tmpWebPass, sizeof(tmpWebPass));
+  }
+
+  if (jsonGetBool(json, "macCustomEnabled", false)) {
+    char tmpMac[18];
+    uint8_t parsedMac[6];
+    if (jsonGetString(json, "mac", tmpMac, sizeof(tmpMac)) &&
+        parseMacString(String(tmpMac), parsedMac) && isMacUnicastValid(parsedMac)) {
+      memcpy(cfgMacAddr, parsedMac, EEPROM_ADDR_MAC_LEN);
+      cfgMacCustomEnabled = true;
+    } else {
+      evLogfL(LOG_LVL_WARN, "[CFG] Restore: MAC del backup invalida -- se ignora ese campo, se mantiene la MAC actual");
+    }
+  } else {
+    cfgMacCustomEnabled = false;
+  }
+
+  if (!anyNetworkFound) {
+    evLogfL(LOG_LVL_ERROR, "[CFG] Restore: el JSON no trae ningun SSID -- probablemente no es un backup valido, se ignora entero");
+  }
+  return anyNetworkFound;
+}
+
+void handleBackup() {
+  if (!checkWebAuth()) return;
+
+  String json = "{";
+  json += "\"formatVersion\":1,";
+  json += "\"espFwVersion\":\"" + String(ESP_FW_VERSION_MAJOR) + "." + String(ESP_FW_VERSION_MINOR) + "\",";
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    json += "\"ssid" + String(i + 1) + "\":\"" + jsonEscape(String(cfgSSID[i])) + "\",";
+    json += "\"pass" + String(i + 1) + "\":\"" + jsonEscape(String(cfgPass[i])) + "\",";
+  }
+  json += "\"webUser\":\"" + jsonEscape(String(cfgWebUser)) + "\",";
+  json += "\"webPass\":\"" + jsonEscape(String(cfgWebPass)) + "\",";
+  json += "\"macCustomEnabled\":" + String(cfgMacCustomEnabled ? "true" : "false") + ",";
+  json += "\"mac\":\"" + (cfgMacCustomEnabled ? macToString(cfgMacAddr) : String("")) + "\"";
+  json += "}";
+
+  // El archivo lleva las passwords en claro (WiFi y del propio portal) --
+  // es la unica forma de que un restore deje todo listo sin tener que
+  // volver a teclearlas. Content-Disposition fuerza la descarga en vez de
+  // mostrarlo en el navegador, pero el fichero en si no va cifrado:
+  // tratarlo como se trataria cualquier fichero con passwords.
+  webServer.sendHeader("Content-Disposition", "attachment; filename=\"z21_emulator_backup.json\"");
+  webServer.send(200, "application/json", json);
+  evLogf("[CFG] Backup descargado desde el portal");
+}
+
+// Handler de SUBIDA (se llama varias veces mientras llega el archivo, ver
+// HTTPUpload). Solo acumula bytes en restoreUploadBuffer; el JSON se
+// interpreta y se aplica despues, en handleRestoreDone(), una vez que ha
+// llegado entero.
+void handleRestoreUpload() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    restoreUploadBuffer = "";
+    restoreUploadTooBig = false;
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (restoreUploadBuffer.length() + upload.currentSize > RESTORE_MAX_UPLOAD_BYTES) {
+      restoreUploadTooBig = true; // se sigue leyendo el resto para no romper el POST, pero se descarta
+    } else {
+      for (size_t i = 0; i < upload.currentSize; i++) {
+        restoreUploadBuffer += (char)upload.buf[i];
+      }
+    }
+  }
+  // UPLOAD_FILE_END: nada que hacer aqui, se procesa todo en handleRestoreDone()
+}
+
+// Handler de FIN de peticion POST /restore (se llama una vez, despues de
+// que handleRestoreUpload() ya haya recibido el archivo entero).
+void handleRestoreDone() {
+  if (!checkWebAuth()) return;
+
+  if (restoreUploadTooBig) {
+    evLogfL(LOG_LVL_ERROR, "[CFG] Restore: archivo demasiado grande (>%d bytes) -- se ignora", RESTORE_MAX_UPLOAD_BYTES);
+    webServer.send(400, "text/html", "<html><body>Archivo demasiado grande para ser un backup valido. <a href='/#config'>Volver</a></body></html>");
+    restoreUploadBuffer = "";
+    return;
+  }
+  if (restoreUploadBuffer.length() == 0) {
+    webServer.send(400, "text/html", "<html><body>No se ha recibido ningun archivo. <a href='/#config'>Volver</a></body></html>");
+    return;
+  }
+
+  bool ok = applyBackupJson(restoreUploadBuffer);
+  restoreUploadBuffer = ""; // liberar la RAM cuanto antes, ya no hace falta
+
+  if (!ok) {
+    webServer.send(400, "text/html", "<html><body>El archivo no tiene el formato de backup esperado (ver log del ESP para el detalle). <a href='/#config'>Volver</a></body></html>");
+    return;
+  }
+
+  saveConfig();
+  evLogf("[CFG] Configuracion restaurada desde backup, reiniciando...");
+  webServer.send(200, "text/html", "<html><body>Restaurado. Reiniciando...</body></html>");
+  delay(500);
+  ESP.restart();
+}
+
 void handleRoot() {
   if (!checkWebAuth()) return;
 
@@ -1265,6 +1454,19 @@ void handleRoot() {
 
   html += "<input type='submit' value='Guardar y reiniciar'>";
   html += "</form>";
+
+  // Backup/restore en su propio <form> (no puede ir anidado dentro del de
+  // arriba -- HTML no permite <form> dentro de <form>, y ademas este
+  // necesita enctype='multipart/form-data' para poder subir un archivo).
+  html += "<h3>Backup / Restore</h3>";
+  html += "<p>El archivo de backup incluye las passwords de las redes WiFi y del propio portal <b>en claro (sin cifrar)</b> -- gu&aacute;rdalo con el mismo cuidado que una password.</p>";
+  html += "<p><a href='/backup'>Descargar backup (JSON)</a></p>";
+  html += "<form method='POST' action='/restore' enctype='multipart/form-data'>";
+  html += "<input type='file' name='backupfile' accept='.json,application/json'> ";
+  html += "<input type='submit' value='Restaurar backup'>";
+  html += "<p><i>Restaurar sobrescribe las redes WiFi, las credenciales del portal y la MAC personalizada con lo que traiga el archivo, y reinicia el ESP.</i></p>";
+  html += "</form>";
+
   html += "<script src='/app.js'></script>";
   html += "</body></html>";
 
@@ -1514,6 +1716,8 @@ void setupWebServer() {
   webServer.on("/style.css", handleStyleCss);
   webServer.on("/app.js", handleAppJs);
   webServer.on("/scan", handleScan);
+  webServer.on("/backup", handleBackup);
+  webServer.on("/restore", HTTP_POST, handleRestoreDone, handleRestoreUpload);
   // TODO: endpoint websocket para el volcado de tramas (fase 2, mas
   // adelante — de momento la pagina /sniffer con auto-refresh es
   // suficiente para depurar el enlace Mega<->ESP)

@@ -125,7 +125,7 @@
 #define MEGA_FW_VERSION_MAJOR 0
 #define MEGA_FW_VERSION_MINOR 8
 #define ESP_FW_VERSION_MAJOR 0
-#define ESP_FW_VERSION_MINOR 10
+#define ESP_FW_VERSION_MINOR 11
 
 // Payload del heartbeat (17 bytes, todo little-endian):
 //   uptimeMs (4) | cycleAvgUs (4) | cycleMaxUs (2) | freeRam (2) |
@@ -255,5 +255,18 @@
 //     /scan activa la interfaz STA solo durante el escaneo y vuelve al
 //     modo anterior al terminar, para no interrumpir a los clientes ya
 //     conectados al AP mas de lo estrictamente necesario.
+//   - v0.14 (2026-08-04): ESP_FW_VERSION_MINOR 10->11. Sin constantes
+//     nuevas en este header; cambios solo en esp8266_wifi.ino: backup y
+//     restore de la configuracion (redes WiFi, credenciales del portal,
+//     MAC personalizada) desde el propio portal. GET /backup descarga la
+//     config actual como JSON (formatVersion:1); POST /restore acepta ese
+//     mismo JSON subido como archivo y lo aplica (con validacion basica:
+//     requiere formatVersion:1 y al menos un SSID, o se ignora entero) y
+//     reinicia. El JSON se parsea a mano (busqueda de "clave":"valor"
+//     literal, sin libreria) porque es un formato plano generado y leido
+//     por el mismo firmware -- mismo criterio que ya se uso en /scan. El
+//     archivo de backup lleva las passwords EN CLARO (es la unica forma
+//     de que el restore no requiera volver a teclearlas); el portal avisa
+//     de esto junto al enlace de descarga.
 
 #endif // Z21_PROTOCOL_H
