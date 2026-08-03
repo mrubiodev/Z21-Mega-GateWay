@@ -125,7 +125,7 @@
 #define MEGA_FW_VERSION_MAJOR 0
 #define MEGA_FW_VERSION_MINOR 8
 #define ESP_FW_VERSION_MAJOR 0
-#define ESP_FW_VERSION_MINOR 7
+#define ESP_FW_VERSION_MINOR 9
 
 // Payload del heartbeat (17 bytes, todo little-endian):
 //   uptimeMs (4) | cycleAvgUs (4) | cycleMaxUs (2) | freeRam (2) |
@@ -204,5 +204,45 @@
 //     solo en el log. No afecta a esp8266_wifi.ino ni al formato NetInfo
 //     por cable (ya llevaba la MAC desde v0.9, solo que el Mega no la
 //     pintaba todavia).
+//   - v0.11 (2026-08-03): ESP_FW_VERSION_MINOR 7->8. Sin constantes nuevas
+//     en este header; cambio solo en esp8266_wifi.ino: ahora se pueden
+//     guardar hasta 3 redes WiFi (SSID+password) en vez de solo una --
+//     connectWiFi() las prueba en orden y solo cae a modo AP si ninguna
+//     conecta. Ademas, estando en modo AP, se reintenta conectar a alguna
+//     de las guardadas cada WIFI_STA_RETRY_INTERVAL_MS (antes era un TODO
+//     sin implementar). El AP de fallback ahora lleva password fija
+//     AP_FIXED_PASSWORD ("z21" de momento -- OJO, son menos de los 8
+//     caracteres minimos de WPA2, asi que de momento el AP sale abierto en
+//     la practica; pendiente alargarla o generarla aleatoriamente y
+//     mostrarla en la pantalla del Mega mas adelante). El layout de EEPROM
+//     cambio para hacer sitio a las 3 redes, por lo que EEPROM_MAGIC subio
+//     de 0x5A a 0x5B (una config vieja de una sola red se ignora limpio en
+//     vez de leerse con el offset equivocado, ver comentario en
+//     esp8266_wifi.ino).
+//   - v0.12 (2026-08-03): ESP_FW_VERSION_MINOR 8->9. Sin constantes nuevas
+//     en este header; todos los cambios en esp8266_wifi.ino (y un archivo
+//     nuevo, esp8266_wifi/web_assets.h):
+//       1. Bug de v0.11: subir el magic global de EEPROM para hacer sitio
+//          a las 3 redes WiFi invalido TAMBIEN el usuario/password del
+//          portal web sin que hubieran cambiado de formato. Se sustituyo
+//          el magic global unico por un byte de validez INDEPENDIENTE por
+//          seccion (redes / credenciales del portal / MAC personalizada),
+//          para que cambiar el layout de una seccion no afecte a las
+//          demas nunca mas.
+//       2. El portal web nunca tuvo forma de cambiar su propio usuario/
+//          password desde el formulario (solo existian por dentro,
+//          siempre con el valor por defecto admin/z21admin) -- ahora
+//          /save (seccion "Acceso al portal") permite cambiarlos, con
+//          confirmacion de password para evitar quedarse fuera por una
+//          errata.
+//       3. El HTML/CSS repetido en cada pagina (barra de nav, apertura de
+//          <head>) se consolido en pageHead()/pageNav(), que ademas
+//          corrige que /log, /sniffer y /test no tenian enlace a Config.
+//       4. El CSS compartido se saco a un archivo aparte (web_assets.h),
+//          comprimido en gzip y guardado en PROGMEM (flash), servido en
+//          /style.css con Content-Encoding: gzip -- no ocupa RAM y pesa
+//          menos por la red que repetir 'style=...' en cada <p>. Los
+//          colores sueltos inline se sustituyeron por clases (.err/.ok/
+//          .warn/.mono/.mega/.esp/.lvl-*) definidas ahi.
 
 #endif // Z21_PROTOCOL_H

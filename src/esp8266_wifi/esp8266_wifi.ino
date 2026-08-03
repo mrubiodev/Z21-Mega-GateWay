@@ -51,6 +51,7 @@ extern "C" {
 }
 
 #include "z21_protocol.h"
+#include "web_assets.h"
 
 // ---------------------------------------------------------------------
 // MODO DE DEPURACIÓN STANDALONE
@@ -187,38 +188,60 @@ bool evLogThrottle(unsigned long &lastMs, unsigned long minIntervalMs) {
 // ---------------------------------------------------------------------
 // Configuración persistente (EEPROM)
 // ---------------------------------------------------------------------
-// Layout simple de EEPROM: [0]=magic, [1..32]=SSID, [33..96]=password,
-// [97..128]=usuario web, [129..192]=password web
-#define EEPROM_SIZE 256
-#define EEPROM_MAGIC 0x5A // marca para saber si hay config guardada
-#define EEPROM_ADDR_MAGIC 0
-#define EEPROM_ADDR_SSID 1
+// v0.12: cada SECCION de la config tiene su PROPIO byte de validez, en
+// vez de un unico magic global para todo el bloque de EEPROM.
+//
+// Motivo (el bug que nos acaba de pasar): en v0.11 habia un solo magic
+// global. Al cambiar el layout de las redes WiFi (de 1 a 3), tuvimos que
+// subirlo para no leer basura -- y de paso se invalido TAMBIEN el usuario/
+// password del portal web, que no habia cambiado de formato para nada.
+// Resultado: credenciales "perdidas" sin haber tocado esa parte.
+//
+// Con un byte de validez por seccion, cambiar el layout de UNA seccion
+// (p.ej. añadir una 4a red WiFi el dia de mañana) solo invalida esa
+// seccion -- las demas (usuario/password del portal, MAC personalizada)
+// se quedan intactas. Cada seccion es responsable solo de sus propios
+// datos y de su propia validez (responsabilidad unica).
+#define EEPROM_SIZE 512
+#define EEPROM_SECTION_VALID 0xC3 // "esta seccion tiene datos guardados con el layout actual"
+
+// --- Seccion: redes WiFi guardadas (hasta 3), ver "Conectividad" abajo ---
+#define EEPROM_ADDR_NET_VALID 0
+#define WIFI_MAX_NETWORKS 3
 #define EEPROM_ADDR_SSID_LEN 32
-#define EEPROM_ADDR_PASS 33
 #define EEPROM_ADDR_PASS_LEN 64
-#define EEPROM_ADDR_WEBUSER 97
+#define EEPROM_NET_BLOCK_LEN (EEPROM_ADDR_SSID_LEN + EEPROM_ADDR_PASS_LEN) // 96 bytes/red
+#define EEPROM_ADDR_NETWORKS (EEPROM_ADDR_NET_VALID + 1) // 3 bloques consecutivos desde aqui
+
+// --- Seccion: credenciales del portal web (usuario/password de acceso) ---
+#define EEPROM_ADDR_WEBAUTH_VALID (EEPROM_ADDR_NETWORKS + WIFI_MAX_NETWORKS * EEPROM_NET_BLOCK_LEN)
+#define EEPROM_ADDR_WEBUSER (EEPROM_ADDR_WEBAUTH_VALID + 1)
 #define EEPROM_ADDR_WEBUSER_LEN 32
-#define EEPROM_ADDR_WEBPASS 129
+#define EEPROM_ADDR_WEBPASS (EEPROM_ADDR_WEBUSER + EEPROM_ADDR_WEBUSER_LEN)
 #define EEPROM_ADDR_WEBPASS_LEN 32
-// MAC personalizada (v0.7): flag de "esta activa" + los 6 bytes de la MAC.
+
+// --- Seccion: MAC personalizada (v0.7) ---
 // Se aplica a STA y AP por igual con wifi_set_macaddr() antes de conectar
-// (ver applyMac()). Si el flag es 0 (nada guardado o campo vaciado), NO se
-// usa la MAC de fabrica del chip: se genera una MAC por defecto con el
-// prefijo (OUI) 84:2B:BC, propio de nuestra red, y los 3 bytes finales
-// derivados del chip ID (estable entre reinicios, distinto por placa).
-// El usuario puede seguir fijando cualquier otra MAC (incluso con otro
-// prefijo) desde el formulario /  -- este es solo el valor por defecto.
-#define EEPROM_ADDR_MAC_FLAG 161
-#define EEPROM_ADDR_MAC 162
+// (ver applyMac()). Si no esta guardada, NO se usa la MAC de fabrica del
+// chip: se genera una MAC por defecto con el prefijo (OUI) 84:2B:BC,
+// propio de nuestra red, y los 3 bytes finales derivados del chip ID
+// (estable entre reinicios, distinto por placa). El usuario puede seguir
+// fijando cualquier otra MAC (incluso con otro prefijo) desde el
+// formulario / -- este es solo el valor por defecto.
+#define EEPROM_ADDR_MAC_VALID (EEPROM_ADDR_WEBPASS + EEPROM_ADDR_WEBPASS_LEN)
+#define EEPROM_ADDR_MAC (EEPROM_ADDR_MAC_VALID + 1)
 #define EEPROM_ADDR_MAC_LEN 6
 #define DEFAULT_MAC_OUI_0 0x84
 #define DEFAULT_MAC_OUI_1 0x2B
 #define DEFAULT_MAC_OUI_2 0xBC
 
-char cfgSSID[EEPROM_ADDR_SSID_LEN + 1] = "";
-char cfgPass[EEPROM_ADDR_PASS_LEN + 1] = "";
+char cfgSSID[WIFI_MAX_NETWORKS][EEPROM_ADDR_SSID_LEN + 1] = {"", "", ""};
+char cfgPass[WIFI_MAX_NETWORKS][EEPROM_ADDR_PASS_LEN + 1] = {"", "", ""};
+// TODO: valores por defecto conocidos ("admin"/"z21admin") -- inseguro
+// mientras no se fuerce un cambio en el primer arranque. handleSave() ya
+// avisa por el log si se guarda dejando la password por defecto.
 char cfgWebUser[EEPROM_ADDR_WEBUSER_LEN + 1] = "admin";
-char cfgWebPass[EEPROM_ADDR_WEBPASS_LEN + 1] = "z21admin"; // TODO: forzar cambio en primer arranque
+char cfgWebPass[EEPROM_ADDR_WEBPASS_LEN + 1] = "z21admin";
 bool cfgMacCustomEnabled = false;
 uint8_t cfgMacAddr[EEPROM_ADDR_MAC_LEN] = {0, 0, 0, 0, 0, 0};
 
@@ -230,9 +253,25 @@ uint8_t cfgMacAddr[EEPROM_ADDR_MAC_LEN] = {0, 0, 0, 0, 0, 0};
 #define AP_FIXED_IP IPAddress(192, 168, 0, 111)
 #define AP_GATEWAY IPAddress(192, 168, 0, 111)
 #define AP_SUBNET IPAddress(255, 255, 255, 0)
+// TODO: fijo por ahora a proposito (no se toca el Mega, que esta con otros
+// procesos). Mas adelante: generar una password aleatoria por placa y
+// mostrarla en la pantalla del Mega, en vez de tenerla fija en el firmware.
+// OJO: WPA2 exige minimo 8 caracteres -- "z21" tiene 3, asi que
+// WiFi.softAP() lo va a rechazar y el AP saldra ABIERTO (sin cifrado) en
+// vez de con esta password. Se deja tal cual porque es lo pedido para
+// esta fase; hay que alargarla (o generarla) antes de considerar esto
+// definitivo.
+#define AP_FIXED_PASSWORD "z21"
+// Cada cuanto, estando en modo AP, se reintenta conectar a alguna de las
+// redes STA guardadas (por si vuelve a estar disponible). No se hace mas
+// a menudo para no cortar a los clientes ya conectados al AP demasiado
+// seguido -- cada intento implica tirar el AP y volver a levantarlo si
+// falla.
+#define WIFI_STA_RETRY_INTERVAL_MS 60000UL
 
 bool isAPMode = false;
 String apSSID = ""; // se rellena en startAPFallback(); usado también en NET_INFO
+unsigned long apModeSinceMs = 0; // 0 = no estamos en AP; si no, marca de tiempo de cuando se entro en AP (para el reintento periodico, ver maybeRetrySTA())
 
 WiFiUDP z21Udp;
 ESP8266WebServer webServer(80);
@@ -269,29 +308,48 @@ void writeEEPROMBytes(int addr, const uint8_t *src, int len) {
 
 void loadConfig() {
   EEPROM.begin(EEPROM_SIZE);
-  uint8_t magic = EEPROM.read(EEPROM_ADDR_MAGIC);
-  if (magic == EEPROM_MAGIC) {
-    readEEPROMString(EEPROM_ADDR_SSID, cfgSSID, EEPROM_ADDR_SSID_LEN);
-    readEEPROMString(EEPROM_ADDR_PASS, cfgPass, EEPROM_ADDR_PASS_LEN);
-    readEEPROMString(EEPROM_ADDR_WEBUSER, cfgWebUser, EEPROM_ADDR_WEBUSER_LEN);
-    readEEPROMString(EEPROM_ADDR_WEBPASS, cfgWebPass, EEPROM_ADDR_WEBPASS_LEN);
-    cfgMacCustomEnabled = (EEPROM.read(EEPROM_ADDR_MAC_FLAG) == EEPROM_MAGIC);
-    if (cfgMacCustomEnabled) {
-      readEEPROMBytes(EEPROM_ADDR_MAC, cfgMacAddr, EEPROM_ADDR_MAC_LEN);
+
+  if (EEPROM.read(EEPROM_ADDR_NET_VALID) == EEPROM_SECTION_VALID) {
+    for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+      int base = EEPROM_ADDR_NETWORKS + i * EEPROM_NET_BLOCK_LEN;
+      readEEPROMString(base, cfgSSID[i], EEPROM_ADDR_SSID_LEN);
+      readEEPROMString(base + EEPROM_ADDR_SSID_LEN, cfgPass[i], EEPROM_ADDR_PASS_LEN);
     }
   }
-  // Si no hay magic, se quedan los valores por defecto declarados arriba
-  // (sin SSID guardado -> irá directo a modo AP, sin MAC personalizada).
+  // si no, se quedan las 3 redes vacias por defecto (-> AP directo)
+
+  if (EEPROM.read(EEPROM_ADDR_WEBAUTH_VALID) == EEPROM_SECTION_VALID) {
+    readEEPROMString(EEPROM_ADDR_WEBUSER, cfgWebUser, EEPROM_ADDR_WEBUSER_LEN);
+    readEEPROMString(EEPROM_ADDR_WEBPASS, cfgWebPass, EEPROM_ADDR_WEBPASS_LEN);
+  }
+  // si no, se quedan admin/z21admin por defecto
+
+  cfgMacCustomEnabled = (EEPROM.read(EEPROM_ADDR_MAC_VALID) == EEPROM_SECTION_VALID);
+  if (cfgMacCustomEnabled) {
+    readEEPROMBytes(EEPROM_ADDR_MAC, cfgMacAddr, EEPROM_ADDR_MAC_LEN);
+  }
 }
 
+// Guarda SIEMPRE las 3 secciones juntas -- de momento el formulario del
+// portal las manda todas en un solo POST a /save. Si el dia de mañana se
+// separan en formularios/handlers distintos, cada seccion ya tiene su
+// propio byte de validez y se podria guardar de forma independiente sin
+// tocar esta funcion en bloque.
 void saveConfig() {
-  EEPROM.write(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
-  writeEEPROMString(EEPROM_ADDR_SSID, cfgSSID, EEPROM_ADDR_SSID_LEN);
-  writeEEPROMString(EEPROM_ADDR_PASS, cfgPass, EEPROM_ADDR_PASS_LEN);
+  EEPROM.write(EEPROM_ADDR_NET_VALID, EEPROM_SECTION_VALID);
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    int base = EEPROM_ADDR_NETWORKS + i * EEPROM_NET_BLOCK_LEN;
+    writeEEPROMString(base, cfgSSID[i], EEPROM_ADDR_SSID_LEN);
+    writeEEPROMString(base + EEPROM_ADDR_SSID_LEN, cfgPass[i], EEPROM_ADDR_PASS_LEN);
+  }
+
+  EEPROM.write(EEPROM_ADDR_WEBAUTH_VALID, EEPROM_SECTION_VALID);
   writeEEPROMString(EEPROM_ADDR_WEBUSER, cfgWebUser, EEPROM_ADDR_WEBUSER_LEN);
   writeEEPROMString(EEPROM_ADDR_WEBPASS, cfgWebPass, EEPROM_ADDR_WEBPASS_LEN);
-  EEPROM.write(EEPROM_ADDR_MAC_FLAG, cfgMacCustomEnabled ? EEPROM_MAGIC : 0);
+
+  EEPROM.write(EEPROM_ADDR_MAC_VALID, cfgMacCustomEnabled ? EEPROM_SECTION_VALID : 0);
   writeEEPROMBytes(EEPROM_ADDR_MAC, cfgMacAddr, EEPROM_ADDR_MAC_LEN);
+
   EEPROM.commit();
 }
 
@@ -402,42 +460,79 @@ void applyMac() {
 // ---------------------------------------------------------------------
 void startAPFallback() {
   isAPMode = true;
+  apModeSinceMs = millis(); // arranca (o reinicia) el contador para el reintento periodico
   apSSID = String(AP_SSID_PREFIX) + String(ESP.getChipId(), HEX);
   WiFi.mode(WIFI_AP);
   applyMac();
   WiFi.softAPConfig(AP_FIXED_IP, AP_GATEWAY, AP_SUBNET);
-  WiFi.softAP(apSSID.c_str()); // TODO: decidir si el AP lleva password o es abierto
+  WiFi.softAP(apSSID.c_str(), AP_FIXED_PASSWORD);
   IPAddress ip = WiFi.softAPIP();
   evLogf("[WiFi] Modo AP SSID=%s IP=%d.%d.%d.%d MAC=%s", apSSID.c_str(), ip[0], ip[1], ip[2], ip[3], WiFi.softAPmacAddress().c_str());
 }
 
+// Intenta conectar, en orden, a cada una de las hasta WIFI_MAX_NETWORKS
+// redes guardadas en EEPROM. Se detiene en la primera que conecte. Si
+// ninguna conecta (o no hay ninguna guardada), cae a modo AP.
+//
+// Se llama tanto en el arranque (setup()) como desde maybeRetrySTA() para
+// reintentar en segundo plano mientras estamos en modo AP -- por eso pone
+// WiFi.mode(WIFI_STA) explicitamente cada vez, para salir limpiamente del
+// modo AP si veniamos de ahi.
 void connectWiFi() {
-  evLogf("=== esp8266_wifi arrancando (v%d.%d) ===", ESP_FW_VERSION_MAJOR, ESP_FW_VERSION_MINOR);
-  if (strlen(cfgSSID) == 0) {
-    evLogf("[WiFi] Sin SSID guardado en EEPROM -> AP directo");
+  bool anySsidConfigured = false;
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    if (strlen(cfgSSID[i]) > 0) { anySsidConfigured = true; break; }
+  }
+
+  if (!anySsidConfigured) {
+    evLogf("[WiFi] Sin ningun SSID guardado en EEPROM -> AP directo");
     startAPFallback();
     return;
   }
 
-  evLogf("[WiFi] Conectando a SSID guardado: %s", cfgSSID);
   WiFi.mode(WIFI_STA);
   applyMac();
-  WiFi.begin(cfgSSID, cfgPass);
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < STA_CONNECT_TIMEOUT_MS) {
-    delay(200);
-    DBG("."); // progreso visual solo por Serial, no vale la pena en el log web
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    if (strlen(cfgSSID[i]) == 0) continue; // slot vacio, se salta
+
+    evLogf("[WiFi] Probando red %d/%d: %s", i + 1, WIFI_MAX_NETWORKS, cfgSSID[i]);
+    WiFi.begin(cfgSSID[i], cfgPass[i]);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < STA_CONNECT_TIMEOUT_MS) {
+      delay(200);
+      DBG("."); // progreso visual solo por Serial, no vale la pena en el log web
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      isAPMode = false;
+      apModeSinceMs = 0; // ya no estamos en AP, se desactiva el reintento periodico
+      IPAddress ip = WiFi.localIP();
+      evLogf("[WiFi] Conectado a %s. IP=%d.%d.%d.%d RSSI=%d MAC=%s", cfgSSID[i], ip[0], ip[1], ip[2], ip[3], WiFi.RSSI(), WiFi.macAddress().c_str());
+      return;
+    }
+
+    evLogfL(LOG_LVL_WARN, "[WiFi] Timeout conectando a %s", cfgSSID[i]);
+    WiFi.disconnect(); // limpio antes de probar la siguiente red
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    isAPMode = false;
-    IPAddress ip = WiFi.localIP();
-    evLogf("[WiFi] Conectado. IP=%d.%d.%d.%d RSSI=%d MAC=%s", ip[0], ip[1], ip[2], ip[3], WiFi.RSSI(), WiFi.macAddress().c_str());
-  } else {
-    evLogfL(LOG_LVL_WARN, "[WiFi] Timeout conectando a %s -> fallback a AP", cfgSSID);
-    startAPFallback();
-  }
+  evLogfL(LOG_LVL_WARN, "[WiFi] Ninguna de las redes guardadas disponible -> fallback a AP");
+  startAPFallback();
+}
+
+// Se llama en cada vuelta de loop(). Mientras estemos en modo AP, cada
+// WIFI_STA_RETRY_INTERVAL_MS reintenta conectar a alguna de las redes
+// guardadas (por si volvio a estar disponible, o si al principio no se
+// via porque el router aun no habia arrancado). connectWiFi() ya se
+// encarga de, si falla, volver a levantar el AP -- aqui solo hay que
+// decidir CUANDO reintentar.
+void maybeRetrySTA() {
+  if (!isAPMode || apModeSinceMs == 0) return;
+  if (millis() - apModeSinceMs < WIFI_STA_RETRY_INTERVAL_MS) return;
+
+  evLogf("[WiFi] En modo AP, reintentando conectar a alguna red guardada...");
+  connectWiFi();
 }
 
 // ---------------------------------------------------------------------
@@ -604,8 +699,8 @@ String decodeSniffFrameLog(uint8_t dirFilter) {
     unsigned long ageMs = millis() - e.ms;
     out += "[+" + String(ageMs / 1000) + "." + String((ageMs % 1000) / 100) + "s] ";
     out += (e.dir == SNIFF_DIR_RX_FROM_MEGA)
-             ? "<span style='color:#59f'>MEGA-&gt;ESP</span> "
-             : "<span style='color:#f95'>ESP-&gt;MEGA</span> ";
+             ? "<span class='mega'>MEGA-&gt;ESP</span> "
+             : "<span class='esp'>ESP-&gt;MEGA</span> ";
     out += "<b>" + String(frameTypeName(e.type)) + "</b> len=" + String(e.len);
     if (e.type == FRAME_TYPE_Z21) {
       out += " :: " + z21CommandDescribe(e.payload, e.payloadLen);
@@ -769,8 +864,12 @@ void buildAndSendNetInfo() {
   // En modo AP el propio ESP es la puerta de enlace de sus clientes; en
   // modo STA es la del router al que nos hemos conectado.
   IPAddress gw = isAPMode ? WiFi.softAPIP() : WiFi.gatewayIP();
-  const char *ssid = isAPMode ? apSSID.c_str() : cfgSSID;
-  uint8_t ssidLen = (uint8_t)strlen(ssid);
+  // Se usa WiFi.SSID() (el SSID real al que estamos conectados) en vez de
+  // cfgSSID directamente: ahora hay hasta 3 redes guardadas, y esta es la
+  // forma mas simple de saber cual de ellas es la activa sin tener que
+  // llevar un indice aparte.
+  String staSSID = isAPMode ? apSSID : WiFi.SSID();
+  uint8_t ssidLen = (uint8_t)staSSID.length();
   if (ssidLen > NET_INFO_SSID_MAXLEN) ssidLen = NET_INFO_SSID_MAXLEN;
 
   uint8_t mac[NET_INFO_MAC_LEN];
@@ -788,7 +887,7 @@ void buildAndSendNetInfo() {
   memcpy(&payload[idx], mac, NET_INFO_MAC_LEN);
   idx += NET_INFO_MAC_LEN;
   payload[idx++] = ssidLen;
-  memcpy(&payload[idx], ssid, ssidLen);
+  memcpy(&payload[idx], staSSID.c_str(), ssidLen);
   idx += ssidLen;
 
   sendToMega(FRAME_TYPE_NET_INFO, payload, idx);
@@ -961,15 +1060,60 @@ bool checkWebAuth() {
   return true;
 }
 
+// ---------------------------------------------------------------------
+// "Chrome" comun a todas las paginas del portal (barra de navegacion +
+// apertura de <head>) -- responsabilidad unica: generar ese marco comun,
+// para no repetirlo (y desincronizarlo) en cada handler por separado.
+// Antes cada handler traia su propia copia literal de la barra de
+// navegacion; /log, /sniffer y /test se habian quedado sin el enlace a la
+// configuracion porque nadie lo actualizo a la vez en los 4 sitios.
+// ---------------------------------------------------------------------
+const char PAGE_NAV[] PROGMEM =
+  "<nav><a href='/'>Estado</a> | <a href='/sniffer'>Sniffer</a> | "
+  "<a href='/log'>Log</a> | <a href='/test'>Prueba de enlace</a> | "
+  "<a href='/#config'>Config</a></nav>";
+
+String pageNav() {
+  return FPSTR(PAGE_NAV);
+}
+
+// Apertura comun de pagina: <head> con la hoja de estilos compartida
+// (/style.css, servida desde PROGMEM en gzip, ver web_assets.h) mas el
+// <title> y el <h1>, y ya deja la barra de nav puesta. Cada handler solo
+// tiene que anadir su contenido propio y cerrar </body></html>.
+// extraHead es para markup adicional dentro de <head> que no todas las
+// paginas necesitan (p.ej. el meta refresh de /log y /sniffer) -- se deja
+// vacio por defecto.
+String pageHead(const char *title, const char *h1, const char *extraHead = "") {
+  String html = "<html><head><meta charset='utf-8'>";
+  html += extraHead;
+  html += "<link rel='stylesheet' href='/style.css'>";
+  html += "<title>" + String(title) + "</title></head><body>";
+  html += "<h1>" + String(h1) + "</h1>";
+  html += pageNav();
+  return html;
+}
+
+void handleStyleCss() {
+  // No requiere autenticacion (checkWebAuth()): es solo CSS estatico, sin
+  // datos sensibles ni de configuracion -- exigir login aqui obligaria al
+  // navegador a mandar Basic Auth (o fallar) antes incluso de poder
+  // pintar la pagina de login/estado, sin ganar nada a cambio.
+  webServer.sendHeader("Content-Encoding", "gzip");
+  webServer.sendHeader("Cache-Control", "public, max-age=86400"); // 1 dia: solo cambia con firmware nuevo
+  webServer.send_P(200, "text/css", (const char *)STYLE_CSS_GZIP, STYLE_CSS_GZIP_LEN);
+}
+
 void handleRoot() {
   if (!checkWebAuth()) return;
 
-  String html = "<html><head><meta charset='utf-8'><title>Z21 Emulator Debug</title></head><body>";
-  html += "<h1>Z21 Emulator - Debug</h1>";
-  html += "<p><a href='/'>Estado</a> | <a href='/sniffer'>Sniffer</a> | <a href='/log'>Log</a> | <a href='/test'>Prueba de enlace</a> | <a href='/save'>Config</a></p>";
+  String html = pageHead("Z21 Emulator Debug", "Z21 Emulator - Debug");
   html += "<h2>Estado general</h2>";
   html += "<p>Firmware ESP: v" + String(ESP_FW_VERSION_MAJOR) + "." + String(ESP_FW_VERSION_MINOR) + "</p>";
   html += "<p>Modo actual: " + String(isAPMode ? "AP (fallback)" : "STA (conectado)") + "</p>";
+  if (!isAPMode) {
+    html += "<p>Red conectada: " + WiFi.SSID() + "</p>";
+  }
   html += "<p>IP: " + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "</p>";
   html += "<p>RSSI: " + String(isAPMode ? 0 : WiFi.RSSI()) + " dBm</p>";
   html += "<p>MAC efectiva: ";
@@ -982,13 +1126,13 @@ void handleRoot() {
   if (udpPacketsSeen > 0) {
     html += "<p>Ultimo origen: " + lastUdpSourceIP.toString() + ":" + String(lastUdpSourcePort) + "</p>";
   } else {
-    html += "<p style='color:red'>Ningun paquete UDP ha llegado nunca a este socket. Revisa que el cliente este en la misma red y apuntando a esta IP y puerto.</p>";
+    html += "<p class='err'>Ningun paquete UDP ha llegado nunca a este socket. Revisa que el cliente este en la misma red y apuntando a esta IP y puerto.</p>";
   }
 
   html += "<h2>Estado del Mega</h2>";
   html += "<p>Sincronizacion inicial: " + String(megaSynced ? "completada" : "en curso (esperando HELLO/SYNC_ACK)") + "</p>";
   if (isMegaOnline()) {
-    html += "<p style='color:green'><b>EN LINEA</b></p>";
+    html += "<p class='ok'><b>EN LINEA</b></p>";
     html += "<p>Firmware Mega: v" + String(megaFwVersionMajor) + "." + String(megaFwVersionMinor) + "</p>";
     html += "<p>Estado: " + String(statusCodeText(megaStatusCode)) + " (codigo " + String(megaStatusCode) + ")</p>";
     html += "<p>Ultimo heartbeat hace: " + String(millis() - lastHeartbeatReceivedMs) + " ms</p>";
@@ -997,10 +1141,10 @@ void handleRoot() {
     html += "<p>RAM libre en el Mega: " + String(megaFreeRam) + " bytes</p>";
     html += "<p>Frames Z21 recibidos OK: " + String(megaFramesOk) + ", con error: " + String(megaFramesBad) + "</p>";
   } else if (lastHeartbeatReceivedMs == 0) {
-    html += "<p style='color:red'><b>NUNCA SE HA RECIBIDO UN HEARTBEAT DEL MEGA</b></p>";
+    html += "<p class='err'><b>NUNCA SE HA RECIBIDO UN HEARTBEAT DEL MEGA</b></p>";
     html += "<p>Revisa: DIP switch en modo MCU&lt;-&gt;ESP, selector fisico RXD3/TXD3, baudios 115200 y cableado.</p>";
   } else {
-    html += "<p style='color:red'><b>SIN RESPUESTA</b> (ultimo heartbeat hace " + String(millis() - lastHeartbeatReceivedMs) + " ms)</p>";
+    html += "<p class='err'><b>SIN RESPUESTA</b> (ultimo heartbeat hace " + String(millis() - lastHeartbeatReceivedMs) + " ms)</p>";
   }
 
   html += "<h2>Enlace Serial Mega↔ESP</h2>";
@@ -1015,10 +1159,14 @@ void handleRoot() {
   html += "<p>Último frame del Mega: tipo=0x" + String(lastMegaFrameType, HEX) + ", len=" + String(lastMegaFrameLen) + ", payload=" + lastFrameHex + "</p>";
 
   // TODO: campo para la direccion de cliente XpressNet (pendiente de definir)
-  html += "<h2>Configuración</h2>";
+  html += "<h2 id='config'>Configuración</h2>";
   html += "<form method='POST' action='/save'>";
-  html += "SSID: <input name='ssid' value='" + String(cfgSSID) + "'><br>";
-  html += "Password: <input name='pass' type='password'><br>";
+  html += "<p>Hasta 3 redes WiFi, se prueban en este orden antes de caer al modo AP. Deja una fila con SSID vacio para no usar ese hueco.</p>";
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    html += "Red " + String(i + 1) + " - SSID: <input name='ssid" + String(i + 1) + "' value='" + String(cfgSSID[i]) + "'> ";
+    html += "Password: <input name='pass" + String(i + 1) + "' type='password'> ";
+    html += "<i>(dejar en blanco para no cambiarla)</i><br>";
+  }
 
   // Campo MAC: vacio = usar la MAC por defecto de esta red (prefijo
   // 84:2B:BC + bytes del chip ID), no la de fabrica del chip. Si se pasa
@@ -1039,6 +1187,18 @@ void handleRoot() {
   html += String(defTail) + "): <input name='mac' value='" + macFieldValue + "' placeholder='AA:BB:CC:DD:EE:FF'><br>";
   html += "<a href='/?genmac=1'>Generar MAC aleatoria (84:2B:BC:xx:xx:xx)</a> (revisa el campo y pulsa Guardar para aplicarla; evita colisiones con otros equipos de la red. Si quieres otro prefijo, escribelo tu directamente en el campo)<br>";
 
+  // Usuario/password de ACCESO a este portal (checkWebAuth()). Antes no
+  // habia forma de cambiarlos desde aqui -- solo existian por dentro con
+  // el valor por defecto admin/z21admin, que nunca se llegaba a tocar.
+  // Password en 2 campos (nueva + repetir) para no arriesgarse a quedar
+  // fuera del portal por una errata al escribirla -- si no coinciden, se
+  // ignora el cambio y se mantiene la anterior (ver handleSave()).
+  html += "<h3>Acceso al portal</h3>";
+  html += "<p>Usuario: <input name='webuser' value='" + String(cfgWebUser) + "'></p>";
+  html += "<p>Password nueva: <input name='webpass' type='password'> ";
+  html += "Repetir: <input name='webpass2' type='password'> ";
+  html += "<i>(dejar ambas en blanco para no cambiarla)</i></p>";
+
   html += "<input type='submit' value='Guardar y reiniciar'>";
   html += "</form>";
   html += "</body></html>";
@@ -1046,13 +1206,14 @@ void handleRoot() {
   webServer.send(200, "text/html", html);
 }
 
-// Color asociado a cada nivel, para que un WARN/ERROR salte a la vista en
-// medio de 60 lineas de INFO sin tener que leer una a una.
-const char *evLogLevelColor(uint8_t level) {
+// Clase CSS asociada a cada nivel (ver lvl-info/lvl-warn/lvl-error en el
+// style.css compartido), para que un WARN/ERROR salte a la vista en medio
+// de 60 lineas de INFO sin tener que leer una a una.
+const char *evLogLevelClass(uint8_t level) {
   switch (level) {
-    case LOG_LVL_WARN: return "#e6a700";
-    case LOG_LVL_ERROR: return "#e44";
-    default: return "#ccc";
+    case LOG_LVL_WARN: return "lvl-warn";
+    case LOG_LVL_ERROR: return "lvl-error";
+    default: return "lvl-info";
   }
 }
 
@@ -1097,10 +1258,7 @@ void handleLog() {
     return;
   }
 
-  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='2'>";
-  html += "<title>Log ESP</title></head><body>";
-  html += "<h1>Log de eventos del ESP</h1>";
-  html += "<p><a href='/'>Estado</a> | <a href='/sniffer'>Sniffer</a> | <a href='/log'>Log</a> | <a href='/test'>Prueba de enlace</a></p>";
+  String html = pageHead("Log ESP", "Log de eventos del ESP", "<meta http-equiv='refresh' content='2'>");
   html += "<p>Eventos totales desde el arranque: " + String(evLogTotal) +
           " (avisos: " + String(evLogWarnTotal) + ", errores: " + String(evLogErrorTotal) + ")";
   if (evLogTotal > EVLOG_LINES) {
@@ -1116,14 +1274,14 @@ void handleLog() {
   html += " | <a href='/log?clear=1'>Limpiar vista</a>";
   html += " | <a href='/log?format=json'>Ver como JSON</a></p>";
 
-  html += "<p style='font-family:monospace; white-space:pre-wrap'>";
+  html += "<p class='mono'>";
   bool any = false;
   for (int i = (int)evLogCount - 1; i >= 0; i--) {
     uint8_t idx = evLogChronoIndex((uint8_t)i);
     if (evLog[idx].level < minLevel) continue;
     any = true;
     unsigned long ageMs = millis() - evLog[idx].ms;
-    html += "<span style='color:" + String(evLogLevelColor(evLog[idx].level)) + "'>";
+    html += "<span class='" + String(evLogLevelClass(evLog[idx].level)) + "'>";
     html += "[+" + String(ageMs / 1000) + "." + String((ageMs % 1000) / 100) + "s] ";
     html += "[" + String(evLogLevelName(evLog[idx].level)) + "] ";
     html += evLog[idx].text;
@@ -1158,10 +1316,7 @@ void handleSniffer() {
   if (dirArg == "mega") dirFilter = SNIFF_DIR_RX_FROM_MEGA;      // solo Mega->ESP
   else if (dirArg == "esp") dirFilter = SNIFF_DIR_TX_TO_MEGA;    // solo ESP->Mega
 
-  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='2'>";
-  html += "<title>Sniffer</title></head><body>";
-  html += "<h1>Sniffer Serial ESP&lt;-&gt;Mega</h1>";
-  html += "<p><a href='/'>Estado</a> | <a href='/sniffer'>Sniffer</a> | <a href='/log'>Log</a> | <a href='/test'>Prueba de enlace</a></p>";
+  String html = pageHead("Sniffer", "Sniffer Serial ESP&lt;-&gt;Mega", "<meta http-equiv='refresh' content='2'>");
   html += "<p>Estado: " + String(sniffOn ? "ACTIVO (capturando)" : "PAUSADO") + "</p>";
   html += "<p>Bytes crudos totales desde el arranque: " + String(totalRawBytesFromMega) + "</p>";
   html += "<p>Frames descartados por checksum de framing: " + String(framesRxChkFailFromMega) + "</p>";
@@ -1175,7 +1330,7 @@ void handleSniffer() {
     if (sniffLogCount == 0) {
       html += "<p>Todavia no ha llegado ningun byte.</p>";
     } else {
-      html += "<p style='font-family:monospace; word-break:break-all'>";
+      html += "<p class='mono-inline'>";
       uint16_t start = (sniffLogCount < SNIFF_LOG_SIZE) ? 0 : sniffLogHead;
       for (uint16_t i = 0; i < sniffLogCount; i++) {
         uint8_t b = sniffLog[(start + i) % SNIFF_LOG_SIZE];
@@ -1193,7 +1348,7 @@ void handleSniffer() {
     html += (dirFilter == SNIFF_DIR_TX_TO_MEGA) ? "<b>ESP-&gt;Mega</b>" : "<a href='/sniffer?dir=esp'>ESP-&gt;Mega</a>";
     html += "</p>";
     html += "<h3>Tramas decodificadas (mas reciente primero, hasta " + String(SNIFF_FRAME_LOG_SIZE) + ")</h3>";
-    html += "<p style='font-family:monospace; white-space:pre-wrap'>";
+    html += "<p class='mono'>";
     html += decodeSniffFrameLog(dirFilter);
     html += "</p>";
   }
@@ -1215,9 +1370,7 @@ void handleTest() {
     sendToMega(FRAME_TYPE_NET_INFO, payload, 1);
   }
 
-  String html = "<html><head><meta charset='utf-8'><title>Prueba de enlace</title></head><body>";
-  html += "<h1>Prueba de enlace Mega↔ESP</h1>";
-  html += "<p><a href='/'>Estado</a> | <a href='/sniffer'>Sniffer</a> | <a href='/log'>Log</a> | <a href='/test'>Prueba de enlace</a></p>";
+  String html = pageHead("Prueba de enlace", "Prueba de enlace Mega↔ESP");
   html += "<p>Envía un frame de prueba al Mega para comprobar que el canal Serie funciona.</p>";
   html += "<p><a href='/test?send=1'>Enviar frame de prueba</a></p>";
   html += "<p>Último frame visto del Mega: tipo=0x" + String(lastMegaFrameType, HEX) + ", len=" + String(lastMegaFrameLen) + "</p>";
@@ -1228,11 +1381,18 @@ void handleTest() {
 void handleSave() {
   if (!checkWebAuth()) return;
 
-  if (webServer.hasArg("ssid")) {
-    webServer.arg("ssid").toCharArray(cfgSSID, EEPROM_ADDR_SSID_LEN + 1);
-  }
-  if (webServer.hasArg("pass") && webServer.arg("pass").length() > 0) {
-    webServer.arg("pass").toCharArray(cfgPass, EEPROM_ADDR_PASS_LEN + 1);
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    String ssidField = "ssid" + String(i + 1);
+    String passField = "pass" + String(i + 1);
+    if (webServer.hasArg(ssidField)) {
+      webServer.arg(ssidField).toCharArray(cfgSSID[i], EEPROM_ADDR_SSID_LEN + 1);
+    }
+    // Igual que con la MAC: el campo de password llega vacio si el usuario
+    // no lo toco (por seguridad no se rellena de vuelta en el formulario),
+    // asi que vacio significa "mantener la que ya habia", no "borrarla".
+    if (webServer.hasArg(passField) && webServer.arg(passField).length() > 0) {
+      webServer.arg(passField).toCharArray(cfgPass[i], EEPROM_ADDR_PASS_LEN + 1);
+    }
   }
 
   if (webServer.hasArg("mac")) {
@@ -1253,8 +1413,27 @@ void handleSave() {
     }
   }
 
+  // Usuario/password de acceso al portal. El username, igual que el resto
+  // de campos, vacio = no tocar. La password requiere los 2 campos
+  // iguales -- si no coinciden se ignora el cambio entero (se mantiene la
+  // password anterior) para no dejar el portal con una password a medio
+  // escribir y sin forma de saber cual quedo guardada.
+  if (webServer.hasArg("webuser") && webServer.arg("webuser").length() > 0) {
+    webServer.arg("webuser").toCharArray(cfgWebUser, EEPROM_ADDR_WEBUSER_LEN + 1);
+  }
+  if (webServer.hasArg("webpass") && webServer.arg("webpass").length() > 0) {
+    String p1 = webServer.arg("webpass");
+    String p2 = webServer.hasArg("webpass2") ? webServer.arg("webpass2") : "";
+    if (p1 == p2) {
+      p1.toCharArray(cfgWebPass, EEPROM_ADDR_WEBPASS_LEN + 1);
+      evLogfL(LOG_LVL_WARN, "[CFG] Password del portal web actualizada");
+    } else {
+      evLogfL(LOG_LVL_ERROR, "[CFG] Las dos passwords del portal no coinciden -- se ignora, se mantiene la anterior");
+    }
+  }
+
   saveConfig();
-  evLogf("[CFG] Configuracion guardada (SSID=%s), reiniciando...", cfgSSID);
+  evLogf("[CFG] Configuracion guardada (SSID1=%s, SSID2=%s, SSID3=%s), reiniciando...", cfgSSID[0], cfgSSID[1], cfgSSID[2]);
 
   webServer.send(200, "text/html", "<html><body>Guardado. Reiniciando...</body></html>");
   delay(500);
@@ -1267,6 +1446,7 @@ void setupWebServer() {
   webServer.on("/sniffer", handleSniffer);
   webServer.on("/log", handleLog);
   webServer.on("/test", handleTest);
+  webServer.on("/style.css", handleStyleCss);
   // TODO: endpoint websocket para el volcado de tramas (fase 2, mas
   // adelante — de momento la pagina /sniffer con auto-refresh es
   // suficiente para depurar el enlace Mega<->ESP)
@@ -1308,6 +1488,5 @@ void setup() {
 void loop() {
   handleZ21Udp();
   webServer.handleClient();
-  // TODO: si estamos en modo AP fallback, reintentar STA periódicamente
-  // en segundo plano (a definir estrategia exacta, ver spec seccion 12).
+  maybeRetrySTA(); // si estamos en AP fallback, reintenta STA cada WIFI_STA_RETRY_INTERVAL_MS
 }

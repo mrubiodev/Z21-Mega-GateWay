@@ -68,6 +68,16 @@ struct DisplayStatusSnapshot {
   uint8_t framesRxBad;
   uint8_t framesRxChkFail;
   uint16_t freeRamBytes;
+
+  // Último estado de locomotora conocido por el core Z21. Sirve para que
+  // la pantalla refleje cambios de velocidad, dirección y funciones (p. ej.
+  // luces/F0) aunque la vista principal siga siendo la de diagnóstico.
+  bool locoValid;
+  uint16_t locoAddress;
+  uint8_t locoStepsCode;
+  uint8_t locoSpeedByte;
+  bool locoForward;
+  uint8_t locoF0;
 };
 
 // Modos de pantalla. Con el hardware actual NO hay encoder ni botones

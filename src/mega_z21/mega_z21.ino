@@ -6,13 +6,23 @@
  * dispositivo como una central legítima (ver docs/Z21_EMULATOR_SPEC.md
  * sección 5, y AGENT.md).
  *
- * IMPORTANTE — TODO ES DUMMY EN ESTA VERSIÓN:
- *   Ningún comando toca hardware real todavía (ni XpressNet, ni track
- *   power, ni locomotoras). Cada función devuelve exactamente lo que la
- *   app espera recibir para darse por satisfecha en las pruebas de
- *   compatibilidad, pero el contenido es fijo/simulado. Los TODOs marcan
- *   dónde hay que enchufar la lógica real más adelante (backend de
- *   tracción XpressNet, etc.) — no reemplazar sin releer el spec.
+ * HANDSHAKE DE IDENTIFICACIÓN (prioridad nº1, ver AGENT.md): LAN_GET_
+ * SERIAL_NUMBER, LAN_GET_HWINFO, LAN_X_GET_VERSION/STATUS, LAN_GET_CODE
+ * siguen siendo simulados/fijos a propósito (lo único que le importa a
+ * la app Z21 es que respondan de forma coherente, no que reflejen
+ * hardware real) — no tocar sin releer la sección 5 del spec.
+ *
+ * TRACCIÓN Y LOCOMOTORAS: YA NO son dummy puro. El núcleo Z21 de este
+ * sketch traduce datagramas LAN_X <-> llamadas a `traction`
+ * (ITractionBackend, ver traction_backend.h) — de qué backend concreto
+ * esté detrás (DummyTractionBackend sin hardware, o
+ * XpressNetTractionBackend como esclavo real de la MultiMaus) se decide
+ * en una sola línea al principio de este fichero (TRACTION_BACKEND_
+ * SELECTED) y es invisible para el resto del sketch. Esto es la "capa de
+ * abstracción backend de tracción" que ya prometía AGENT.md — ver ese
+ * fichero y docs/Z21_EMULATOR_SPEC.md sección 11 para el roadmap
+ * (XpressNet v1 -> LocoNet v2 -> DCC directo v3, mismo core Z21 sin
+ * reescribir nada de este fichero).
  *
  * DIAGNÓSTICO: el Mega manda un heartbeat periódico al ESP con tiempos de
  * ciclo, RAM libre y contadores de frames — el ESP lo usa para saber si el
@@ -58,11 +68,28 @@
 
 #include <avr/wdt.h>
 #include <EEPROM.h>
-#include "z21_protocol.h"
-#include "loco_state.h" // struct DummyLocoState — ver ese fichero para el motivo de estar separado
-#include "display_manager.h" // pantalla 3.5" TFT: estado + log de comunicación
+#include "protocol/z21_protocol.h"
+#include "traction/traction_config.h"  // TRACTION_BACKEND_SELECTED — cambiar de backend SOLO aquí
+#include "traction/traction_types.h"   // LocoState/TrackState — formato compartido, ver AGENT.md
+#include "traction/traction_backend.h" // ITractionBackend — el núcleo Z21 SOLO conoce esta interfaz
+#include "traction/traction_backend_dummy.h"     // backend sin hardware, para validar el handshake Z21
+#include "traction/traction_backend_xpressnet.h" // backend real, esclavo XpressNet de la MultiMaus
+                                         // (contenido vacío si no está seleccionado, ver ese .h)
+#include "display/display_manager.h" // pantalla 3.5" TFT: estado + log de comunicación
                              // (ver AGENT.md, "Pantalla 3.5 TFT", y
                              // docs/Z21_EMULATOR_SPEC.md sección 9)
+
+// El núcleo Z21 de este sketch habla SOLO con `traction` (ITractionBackend,
+// ver traction_backend.h) — de qué backend concreto se trate se decide en
+// traction_config.h y es invisible desde aquí en adelante.
+#if TRACTION_BACKEND_SELECTED == TRACTION_BACKEND_XPRESSNET
+XpressNetTractionBackend traction;
+#else
+DummyTractionBackend traction;
+#endif
+
+LocoState lastLocoState;
+bool hasLastLocoState = false;
 
 #define LINK_SERIAL Serial3
 #define LINK_BAUD 115200
@@ -455,22 +482,18 @@ void handleGetBroadcastFlags() {
 }
 
 // ---------------------------------------------------------------------
-// Estado dummy de tracción (track power / parada de emergencia). TODO:
-// sustituir por el backend real de XpressNet; mientras tanto, este estado
-// SÍ se guarda de verdad (no son solo acks fijos) para que
-// LAN_X_GET_STATUS y LAN_SYSTEMSTATE_GETDATA respondan de forma coherente
-// entre sí y con lo último que pidió la app — requisito básico para que
-// la central "parezca" viva y no una simulación estática.
+// Estado de vía: SIEMPRE viene de traction.getTrackState() (backend
+// activo, ver selector arriba), nunca de una variable propia del núcleo
+// Z21 — así LAN_X_GET_STATUS y LAN_SYSTEMSTATE_GETDATA responden de
+// forma coherente entre sí y con el backend real, sea cual sea.
 // ---------------------------------------------------------------------
-bool dummyTrackPowerOn = false;  // arranca en OFF, como toda central Z21 real
-bool dummyEmergencyStop = false;
-
 uint8_t buildCentralStateByte() {
+  TrackState ts = traction.getTrackState();
   uint8_t s = 0;
-  if (!dummyTrackPowerOn) s |= CS_TRACK_VOLTAGE_OFF;
-  if (dummyEmergencyStop) s |= CS_EMERGENCY_STOP;
-  // CS_SHORT_CIRCUIT y CS_PROGRAMMING_MODE_ACTIVE: sin simular todavía, no
-  // hay backend real de tracción ni modo de programación implementado.
+  if (!ts.powerOn) s |= CS_TRACK_VOLTAGE_OFF;
+  if (ts.emergencyStop) s |= CS_EMERGENCY_STOP;
+  if (ts.shortCircuit) s |= CS_SHORT_CIRCUIT;
+  if (ts.serviceModeActive) s |= CS_PROGRAMMING_MODE_ACTIVE;
   return s;
 }
 
@@ -480,9 +503,9 @@ uint8_t buildCentralStateByte() {
 // ejemplo justo este — es decir, la app puede apoyarse en esta respuesta
 // (además de LAN_GET_SERIAL_NUMBER/HWINFO) para decidir si la central es
 // válida. SystemState son 16 bytes fijos (ver z21_protocol.h, bitmask
-// CS_*); se usa el mismo dummy "track power off, resto normal" que ya
-// declara handleXGetStatus() (X-Header 0x62/0x22), para que ambas
-// respuestas sean coherentes entre sí.
+// CS_*); usa el mismo buildCentralStateByte() (estado real del backend
+// de tracción activo) que declara handleXGetStatus() (X-Header 0x62/
+// 0x22), para que ambas respuestas sean coherentes entre sí.
 void handleSystemStateGetData() {
   uint8_t data[16];
 
@@ -497,7 +520,8 @@ void handleSystemStateGetData() {
   uint16_t supplyMv = 12000 + (jitterSlow * 20);           // 12000..12080 mV (dummy)
 
   uint16_t mainCurrentMa = 0;
-  if (dummyTrackPowerOn && !dummyEmergencyStop) {
+  TrackState ts = traction.getTrackState();
+  if (ts.powerOn && !ts.emergencyStop) {
     // Corriente de "reposo" simulada, como si hubiera locomotoras dummy
     // conectadas y consumiendo con la vía activa.
     uint16_t jitterFast = (uint16_t)((millis() / 500) % 30); // 0..29, cambia cada 0.5s
@@ -538,8 +562,8 @@ void handleXGetVersion() {
 }
 
 void handleXGetStatus() {
-  // X-Header 0x62, DB0 0x22, Status (real: refleja track power / e-stop
-  // dummy, ver buildCentralStateByte), checksum
+  // X-Header 0x62, DB0 0x22, Status (real: refleja el TrackState del
+  // backend de tracción activo, ver buildCentralStateByte), checksum
   uint8_t x[4];
   x[0] = 0x62;
   x[1] = 0x22;
@@ -570,64 +594,33 @@ void handleXGetFirmwareVersion() {
 }
 
 // ---------------------------------------------------------------------
-// DUMMY: resto de comandos v1 — responden algo válido pero simulado.
-// TODO: sustituir por el backend de tracción real (XpressNet) cuando
-// toque, sin tocar el handshake de arriba.
+// Comandos v1 de tracción y locomotoras: el núcleo Z21 solo traduce
+// entre el formato de datagrama LAN_X y llamadas a `traction`
+// (ITractionBackend) — qué backend sea de verdad (dummy o XpressNet) es
+// invisible desde aquí, ver el selector al principio del sketch.
 // ---------------------------------------------------------------------
 void handleXSetTrackPowerOff() {
-  // TODO real: cortar tracción de verdad vía XpressNet
-  dummyTrackPowerOn = false;
+  traction.setTrackPower(false);
   uint8_t x[3] = { 0x61, 0x00, 0x00 };
   x[2] = xorChecksum(x, 2);
-  sendXDataset(x, 3); // LAN_X_BC_TRACK_POWER_OFF (dummy ack)
-  displayLogF(F("Track power OFF (dummy)"));
+  sendXDataset(x, 3); // LAN_X_BC_TRACK_POWER_OFF
+  displayLogF(F("Track power OFF"));
 }
 
 void handleXSetTrackPowerOn() {
-  // TODO real: activar tracción de verdad vía XpressNet
   // Verificado contra el PDF (sección 2.6): este comando también termina
   // la parada de emergencia y el modo de programación si estuvieran
-  // activos — se replica aquí para el estado dummy.
-  dummyTrackPowerOn = true;
-  dummyEmergencyStop = false;
+  // activos — cada backend concreto de ITractionBackend::setTrackPower
+  // replica esa misma regla (ver traction_backend_dummy.h /
+  // traction_backend_xpressnet.cpp).
+  traction.setTrackPower(true);
   uint8_t x[3] = { 0x61, 0x01, 0x00 };
   x[2] = xorChecksum(x, 2);
-  sendXDataset(x, 3); // LAN_X_BC_TRACK_POWER_ON (dummy ack)
-  displayLogF(F("Track power ON (dummy)"));
+  sendXDataset(x, 3); // LAN_X_BC_TRACK_POWER_ON
+  displayLogF(F("Track power ON"));
 }
 
-// ---------------------------------------------------------------------
-// Tabla de estado de locomotoras (RAM, se pierde al reiniciar). TODO
-// real: sustituir por lectura/escritura de verdad al backend XpressNet
-// — de momento SÍ se guarda el estado que la propia app manda (antes se
-// respondía "todo a cero" siempre, sin memoria real). Investigado contra
-// la librería z21 de referencia (Digital-MoBa/Z21): allí el guardado real
-// vive en el backend (notifyz21LocoState), la capa de protocolo solo
-// pide/entrega el dato — aquí, sin backend todavía, la propia tabla RAM
-// hace ese papel. El struct DummyLocoState vive en loco_state.h, no aquí
-// (ver ese fichero para el motivo).
-// ---------------------------------------------------------------------
-#define MAX_DUMMY_LOCOS 8
-DummyLocoState dummyLocos[MAX_DUMMY_LOCOS];
-
-// Busca la locomotora por dirección; si no existe, ocupa un slot libre. Si
-// la tabla está llena, recicla el primer slot (política simple sin LRU
-// real — suficiente para esta versión dummy con pocas locos a la vez).
-DummyLocoState *findOrAllocLoco(uint16_t addr) {
-  for (uint8_t i = 0; i < MAX_DUMMY_LOCOS; i++) {
-    if (dummyLocos[i].address == addr) return &dummyLocos[i];
-  }
-  for (uint8_t i = 0; i < MAX_DUMMY_LOCOS; i++) {
-    if (dummyLocos[i].address == 0) {
-      dummyLocos[i] = { addr, 4, 0x80, 0, 0, 0, 0 }; // 128 pasos, parada, sentido adelante
-      return &dummyLocos[i];
-    }
-  }
-  dummyLocos[0] = { addr, 4, 0x80, 0, 0, 0, 0 };
-  return &dummyLocos[0];
-}
-
-void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const DummyLocoState *loco) {
+void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *loco) {
   uint8_t x[10];
   x[0] = 0xEF; // X-Header LAN_X_LOCO_INFO
   x[1] = adrMsbRaw; // la app ignora los 2 bits altos, se devuelve tal cual se pidió
@@ -642,94 +635,88 @@ void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const DummyLocoStat
   sendXDataset(x, 10);
 }
 
-// Aplica un cambio de una única función (LAN_X_SET_LOCO_FUNCTION, DB3 =
-// TTNNNNNN). F0-F4 usan el orden de bits especial de DB4 (ver struct);
-// F5-F28 son bit directo dentro de su byte. F29+ quedan fuera de esta
-// tabla dummy (no hay campo reservado para ellas todavía).
-void applySingleLocoFunction(DummyLocoState *loco, uint8_t index, uint8_t type) {
-  if (type == 0b11) return; // "no permitido" según el PDF
-  uint8_t *targetByte;
-  uint8_t bitPos;
-  if (index <= 4) {
-    targetByte = &loco->f0to4;
-    switch (index) {
-      case 0: bitPos = 4; break; // L
-      case 1: bitPos = 0; break; // J
-      case 2: bitPos = 1; break; // H
-      case 3: bitPos = 2; break; // G
-      default: bitPos = 3; break; // F (index==4)
-    }
-  } else if (index <= 12) {
-    targetByte = &loco->f5to12; bitPos = index - 5;
-  } else if (index <= 20) {
-    targetByte = &loco->f13to20; bitPos = index - 13;
-  } else if (index <= 28) {
-    targetByte = &loco->f21to28; bitPos = index - 21;
-  } else {
-    return; // F29+: fuera de alcance de esta tabla dummy, ver TODO arriba
-  }
-  uint8_t mask = (uint8_t)(1 << bitPos);
-  if (type == 0b00) *targetByte &= ~mask;      // apagar
-  else if (type == 0b01) *targetByte |= mask;  // encender
-  else *targetByte ^= mask;                     // 0b10: conmutar
-}
-
 void handleXGetLocoInfo(const uint8_t *reqData, uint8_t reqLen) {
   // Verificado contra el PDF (sección 4.4): la respuesta mínima necesita
-  // DB0-DB7 (8 bytes) + XHeader + checksum = 10 bytes en total. La
-  // primera versión de este código se dejaba el DB7 (F21-F28) sin enviar
-  // y respondía siempre "todo a cero"; ahora lee la tabla real de arriba.
+  // DB0-DB7 (8 bytes) + XHeader + checksum = 10 bytes en total.
   if (reqLen < 4) return; // XHeader 0xE3 + DB0(0xF0) + AddrH + AddrL esperado
   uint16_t addr = ((uint16_t)(reqData[2] & 0x3F) << 8) | reqData[3];
-  DummyLocoState *loco = findOrAllocLoco(addr);
+  // Dispara un refresco desde el bus real si el backend es asíncrono (en
+  // el dummy no hace nada, ver ITractionBackend::requestLocoRefresh). La
+  // respuesta a la app se contesta YA con el último dato conocido — no
+  // se puede hacer esperar a la app al tiempo de vuelta del bus físico,
+  // ver traction_backend.h.
+  traction.requestLocoRefresh(addr);
+  const LocoState *loco = traction.getLocoState(addr);
+  if (loco != nullptr) {
+    lastLocoState = *loco;
+    hasLastLocoState = true;
+  }
   sendLocoInfoResponse(reqData[2], reqData[3], loco);
 }
 
 void handleXSetLocoDriveOrFunction(const uint8_t *data, uint8_t dataLen) {
-  // TODO real: aplicar el comando vía backend de tracción (XpressNet, no
-  // implementado todavía — ningún byte de esto llega de verdad a la vía).
-  // De momento SÍ se guarda en la tabla dummyLocos (antes no se hacía
-  // nada en absoluto con estos comandos).
   if (dataLen < 4) return; // XHeader + DB0 + Adr_MSB + Adr_LSB como mínimo
   uint8_t db0 = data[1];
   uint16_t addr = ((uint16_t)(data[2] & 0x3F) << 8) | data[3];
-  DummyLocoState *loco = findOrAllocLoco(addr);
 
   if ((db0 & 0xF0) == 0x10 && dataLen >= 5) {
     // LAN_X_SET_LOCO_DRIVE (PDF sección 4.2)
-    if (db0 == 0x10) loco->stepsCode = 0;       // 14 pasos
-    else if (db0 == 0x12) loco->stepsCode = 2;  // 28 pasos
-    else loco->stepsCode = 4;                   // 128 pasos (0x13 y variantes)
-    loco->speedByte = data[4];
+    uint8_t stepsCode;
+    if (db0 == 0x10) stepsCode = 0;       // 14 pasos
+    else if (db0 == 0x12) stepsCode = 2;  // 28 pasos
+    else stepsCode = 4;                   // 128 pasos (0x13 y variantes)
+    traction.setLocoDrive(addr, stepsCode, data[4]);
+    // Confirmación visible en el log de pantalla — sin esto, un cambio de
+    // velocidad/sentido solo se reflejaba en la fila "Loco#..." de la
+    // cabecera (fácil de no notar), a diferencia de track power ON/OFF que
+    // sí logueaba explícitamente (ver handleXSetTrackPowerOff/On).
+    displayLogf("Loco %u: V=%u %s", (unsigned)addr,
+                (unsigned)(data[4] & 0x7F),
+                (data[4] & 0x80) ? "FWD" : "REV");
   } else if (db0 == 0xF8 && dataLen >= 5) {
     // LAN_X_SET_LOCO_FUNCTION (PDF sección 4.3.1): DB3 = TTNNNNNN
-    applySingleLocoFunction(loco, data[4] & 0x3F, (data[4] >> 6) & 0x03);
+    uint8_t index = data[4] & 0x3F;
+    uint8_t type = (data[4] >> 6) & 0x03;
+    if (type != 0b11) { // 0b11 = "no permitido" según el PDF
+      traction.setLocoFunction(addr, index, static_cast<FunctionOp>(type));
+      static const char *kFuncOpLabel[3] = { "OFF", "ON", "TOGGLE" };
+      displayLogf("Loco %u: F%u %s", (unsigned)addr, (unsigned)index,
+                  kFuncOpLabel[type]);
+    }
   } else if (db0 == 0x20 && dataLen >= 5) {
-    // LAN_X_SET_LOCO_FUNCTION_GROUP grupo 1, F0-F4 (PDF 4.3.2): el byte
-    // Functions ya usa el mismo orden de bits que DB4 en la respuesta.
-    loco->f0to4 = data[4] & 0x1F;
+    // LAN_X_SET_LOCO_FUNCTION_GROUP grupo 1, F0-F4 (PDF 4.3.2)
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F0toF4, data[4]);
+    displayLogf("Loco %u: F0-F4 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
   } else if (db0 == 0x21 && dataLen >= 5) {
-    loco->f5to12 = (loco->f5to12 & 0xF0) | (data[4] & 0x0F); // grupo 2: F5-F8
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F5toF8, data[4]); // grupo 2
+    displayLogf("Loco %u: F5-F8 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
   } else if (db0 == 0x22 && dataLen >= 5) {
-    loco->f5to12 = (loco->f5to12 & 0x0F) | ((data[4] & 0x0F) << 4); // grupo 3: F9-F12
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F9toF12, data[4]); // grupo 3
+    displayLogf("Loco %u: F9-F12 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
   } else if (db0 == 0x23 && dataLen >= 5) {
-    loco->f13to20 = data[4]; // grupo 4: F13-F20 completo
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F13toF20, data[4]); // grupo 4
+    displayLogf("Loco %u: F13-F20 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
   } else if (db0 == 0x28 && dataLen >= 5) {
-    loco->f21to28 = data[4]; // grupo 5: F21-F28 completo
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F21toF28, data[4]); // grupo 5
+    displayLogf("Loco %u: F21-F28 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
   }
   // TODO: grupos 6-10 (F29-F68, PDF 4.3.2) y LAN_X_SET_LOCO_BINARY_STATE
-  // (4.3.3) quedan fuera de esta tabla dummy — no hay campo reservado
-  // para funciones >F28 todavía.
+  // (4.3.3) quedan fuera todavía — LocoState no tiene campo reservado
+  // para funciones >F28 (ver traction_types.h).
 
-  sendLocoInfoResponse(data[2], data[3], loco);
+  const LocoState *updatedLoco = traction.getLocoState(addr);
+  if (updatedLoco != nullptr) {
+    lastLocoState = *updatedLoco;
+    hasLastLocoState = true;
+  }
+  sendLocoInfoResponse(data[2], data[3], updatedLoco);
 }
 
 void handleXSetStop() {
-  // TODO real: parada de emergencia real por XpressNet
-  dummyEmergencyStop = true;
+  traction.emergencyStopAll();
   uint8_t x[3] = { 0x81, 0x00, 0x00 };
   x[2] = xorChecksum(x, 2);
-  sendXDataset(x, 3); // LAN_X_BC_STOPPED (dummy ack)
+  sendXDataset(x, 3); // LAN_X_BC_STOPPED
   displayLogF(F("*** PARADA DE EMERGENCIA ***"));
 }
 
@@ -915,6 +902,20 @@ DisplayStatusSnapshot buildDisplaySnapshot() {
   snap.framesRxBad = framesRxBad;
   snap.framesRxChkFail = framesRxChkFail;
   snap.freeRamBytes = (uint16_t)freeRam();
+  snap.locoValid = hasLastLocoState;
+  if (hasLastLocoState) {
+    snap.locoAddress = lastLocoState.address;
+    snap.locoStepsCode = lastLocoState.stepsCode;
+    snap.locoSpeedByte = lastLocoState.speedByte;
+    snap.locoForward = (lastLocoState.speedByte & 0x80) != 0;
+    snap.locoF0 = (lastLocoState.f0to4 >> 4) & 0x01;
+  } else {
+    snap.locoAddress = 0;
+    snap.locoStepsCode = 4;
+    snap.locoSpeedByte = 0x80;
+    snap.locoForward = true;
+    snap.locoF0 = 0;
+  }
   return snap;
 }
 
@@ -1047,8 +1048,16 @@ void setup() {
     displayLogF(F("!! Reinicio por WATCHDOG !!"));
   }
 
-  // TODO: inicializar Serial1/2 (RS485 XpressNet) — no usado todavía en
-  // esta versión dummy.
+  // Backend de tracción activo (ver selector al principio del sketch).
+  // El backend XpressNet inicializa aquí dentro su propio Serial1 (RS485)
+  // vía la librería externa — el dummy no toca ningún puerto físico.
+  traction.begin();
+#if TRACTION_BACKEND_SELECTED == TRACTION_BACKEND_XPRESSNET
+  displayLogF(F("Backend traccion: XpressNet"));
+#else
+  displayLogF(F("Backend traccion: DUMMY (sin bus)"));
+#endif
+
   // TODO: SD del shield (log de sesión + base de datos de locomotoras) y
   //       encoder rotativo — no usado todavía, ver display_types.h
   //       (DisplayScreenMode) para cómo se prevé encajar el encoder más
@@ -1065,20 +1074,16 @@ void loop() {
                // tiempo del timeout, el watchdog resetea el Mega solo
 
   trackCycleTime();
+  traction.poll(); // no bloqueante: ver ITractionBackend::poll() en traction_backend.h
   sendHeartbeatIfDue();
   updateStatusLed();
-  // NOTA DE FUSIÓN: se mantiene comentado A PROPÓSITO. No es un olvido de
-  // la rama que añadió la pantalla: fue una decisión deliberada para
-  // depurar el bug real de comunicación ESP<->Mega (maxLen uint8_t/
-  // uint16_t, ver tryReadFrameFromESP más arriba) sin la variable
-  // adicional de la pantalla (coste de SPI/bus paralelo por ciclo de
-  // loop()) de por medio.
-  // TODO: una vez verificado en hardware real que el fix de maxLen
-  // restaura la comunicación ESP<->Mega (framesRxOk avanzando, sin
-  // framesRxChkFail creciendo de forma anómala), descomentar la línea de
-  // abajo para reactivar el refresco en vivo de la cabecera de estado.
-  // El resto del módulo de pantalla (displayInit, displayLog*) ya está
-  // activo y no requiere cambios.
+  // NOTA DE FUSIÓN (histórico): durante la depuración del bug de framing
+  // ESP<->Mega (maxLen uint8_t/uint16_t, ver tryReadFrameFromESP más
+  // arriba) esta llamada estuvo comentada a propósito, para descartar el
+  // coste de SPI/bus paralelo del refresco de cabecera mientras se
+  // buscaba el bug real. Ya verificado en hardware que el fix de maxLen
+  // restaura la comunicación, así que el refresco en vivo de la cabecera
+  // está reactivado (línea de abajo) — no volver a comentarla sin motivo.
   displayTick(buildDisplaySnapshot());
 
   if (!synced) {

@@ -24,9 +24,9 @@
 #include "display_status_panel.h"
 #include "display_driver.h"
 #include "display_theme.h"
-#include "z21_protocol.h" // STATUS_*, NET_INFO_MODE_* — únicas constantes de
-                           // protocolo que este módulo necesita, solo para
-                           // decidir qué texto/color mostrar
+#include "../protocol/z21_protocol.h" // STATUS_*, NET_INFO_MODE_* — únicas constantes de
+                                     // protocolo que este módulo necesita, solo para
+                                     // decidir qué texto/color mostrar
 #include <string.h>
 #include <stdio.h>
 
@@ -81,6 +81,10 @@ static uint16_t statusCodeColor(uint8_t code) {
     case STATUS_WATCHDOG_RECOVERED: return COLOR_VALUE_BAD;
     default:                        return COLOR_VALUE_NEUTRAL;
   }
+}
+
+static const char *locoDirectionLabel(bool forward) {
+  return forward ? "FWD" : "REV";
 }
 
 void displayStatusPanelInit(const DisplayLayout &layout) {
@@ -163,10 +167,19 @@ void displayStatusPanelUpdate(const DisplayStatusSnapshot &snap) {
     g_lastRowText[2][STATUS_ROW_MAXLEN] = '\0';
   }
 
-  // Fila 4: estado global de salud (STATUS_*) + RAM libre + uptime.
-  snprintf(line, sizeof(line), "Estado: %s  RAM=%uB",
-           statusCodeLabel(snap.statusCode), (unsigned)snap.freeRamBytes);
-  color = statusCodeColor(snap.statusCode);
+  // Fila 4: estado de la última locomotora controlada y estado global.
+  if (snap.locoValid) {
+    snprintf(line, sizeof(line), "Loco#%u %s V=%u F0=%u %s",
+             (unsigned)snap.locoAddress,
+             locoDirectionLabel(snap.locoForward),
+             (unsigned)(snap.locoSpeedByte & 0x7F),
+             (unsigned)snap.locoF0,
+             statusCodeLabel(snap.statusCode));
+  } else {
+    snprintf(line, sizeof(line), "Loco: sin datos  %s",
+             statusCodeLabel(snap.statusCode));
+  }
+  color = snap.locoValid ? COLOR_VALUE_OK : statusCodeColor(snap.statusCode);
   if (g_forceRedrawAll || strcmp(line, g_lastRowText[3]) != 0) {
     drawDynamicRow(3, line, color);
     strncpy(g_lastRowText[3], line, STATUS_ROW_MAXLEN);
