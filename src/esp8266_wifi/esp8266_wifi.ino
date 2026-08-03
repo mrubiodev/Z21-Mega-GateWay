@@ -1104,6 +1104,67 @@ void handleStyleCss() {
   webServer.send_P(200, "text/css", (const char *)STYLE_CSS_GZIP, STYLE_CSS_GZIP_LEN);
 }
 
+void handleAppJs() {
+  // Mismo razonamiento que handleStyleCss(): estatico, sin datos
+  // sensibles, no requiere autenticacion.
+  webServer.sendHeader("Content-Encoding", "gzip");
+  webServer.sendHeader("Cache-Control", "public, max-age=86400");
+  webServer.send_P(200, "application/javascript", (const char *)APP_JS_GZIP, APP_JS_GZIP_LEN);
+}
+
+// Escapa un String para poder meterlo como valor string dentro de JSON
+// (comillas y backslash escapados, caracteres de control fuera). Los SSID
+// normalmente no llevan nada raro, pero nada impide que alguien ponga
+// comillas en el suyo -- sin esto, ese SSID rompería el JSON generado.
+String jsonEscape(const String &in) {
+  String out;
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if ((uint8_t)c >= 0x20) {
+      out += c; // los caracteres de control (<0x20) se descartan directamente
+    }
+  }
+  return out;
+}
+
+// Escanea las redes WiFi visibles y las devuelve en JSON, para que el
+// formulario de configuracion las ofrezca en una lista en vez de tener
+// que escribir el SSID a mano (ver scanNetworks() en app.js / web_assets.h).
+void handleScan() {
+  if (!checkWebAuth()) return;
+
+  // WiFi.scanNetworks() necesita la interfaz STA activa. Si estamos en
+  // modo AP (fallback), se activa STA tambien solo para el escaneo y se
+  // vuelve al modo original al terminar -- así no se deja un STA a medias
+  // colgado ni se interrumpe el AP para los clientes ya conectados a el.
+  WiFiMode_t prevMode = WiFi.getMode();
+  if (prevMode == WIFI_AP) {
+    WiFi.mode(WIFI_AP_STA);
+  }
+
+  int n = WiFi.scanNetworks();
+  evLogf("[WiFi] Escaneo manual desde el portal: %d redes visibles", n);
+
+  String json = "[";
+  for (int i = 0; i < n; i++) {
+    if (i > 0) json += ",";
+    json += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    json += "\"enc\":" + String(WiFi.encryptionType(i) == ENC_TYPE_NONE ? 0 : 1) + "}";
+  }
+  json += "]";
+  WiFi.scanDelete(); // libera la memoria de los resultados del escaneo
+
+  if (prevMode == WIFI_AP) {
+    WiFi.mode(WIFI_AP); // volver al modo original, no dejar STA activo sin usarlo
+  }
+
+  webServer.send(200, "application/json", json);
+}
+
 void handleRoot() {
   if (!checkWebAuth()) return;
 
@@ -1162,8 +1223,11 @@ void handleRoot() {
   html += "<h2 id='config'>Configuración</h2>";
   html += "<form method='POST' action='/save'>";
   html += "<p>Hasta 3 redes WiFi, se prueban en este orden antes de caer al modo AP. Deja una fila con SSID vacio para no usar ese hueco.</p>";
+  html += "<p><button type='button' onclick='scanNetworks()'>Buscar redes WiFi</button> ";
+  html += "<i>(tarda unos segundos; pulsa \"Red 1/2/3\" junto a la que quieras para rellenar ese hueco)</i></p>";
+  html += "<div id='scanResults'></div>";
   for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
-    html += "Red " + String(i + 1) + " - SSID: <input name='ssid" + String(i + 1) + "' value='" + String(cfgSSID[i]) + "'> ";
+    html += "Red " + String(i + 1) + " - SSID: <input id='ssid" + String(i + 1) + "' name='ssid" + String(i + 1) + "' value='" + String(cfgSSID[i]) + "'> ";
     html += "Password: <input name='pass" + String(i + 1) + "' type='password'> ";
     html += "<i>(dejar en blanco para no cambiarla)</i><br>";
   }
@@ -1201,6 +1265,7 @@ void handleRoot() {
 
   html += "<input type='submit' value='Guardar y reiniciar'>";
   html += "</form>";
+  html += "<script src='/app.js'></script>";
   html += "</body></html>";
 
   webServer.send(200, "text/html", html);
@@ -1447,6 +1512,8 @@ void setupWebServer() {
   webServer.on("/log", handleLog);
   webServer.on("/test", handleTest);
   webServer.on("/style.css", handleStyleCss);
+  webServer.on("/app.js", handleAppJs);
+  webServer.on("/scan", handleScan);
   // TODO: endpoint websocket para el volcado de tramas (fase 2, mas
   // adelante — de momento la pagina /sniffer con auto-refresh es
   // suficiente para depurar el enlace Mega<->ESP)

@@ -125,7 +125,7 @@
 #define MEGA_FW_VERSION_MAJOR 0
 #define MEGA_FW_VERSION_MINOR 8
 #define ESP_FW_VERSION_MAJOR 0
-#define ESP_FW_VERSION_MINOR 9
+#define ESP_FW_VERSION_MINOR 10
 
 // Payload del heartbeat (17 bytes, todo little-endian):
 //   uptimeMs (4) | cycleAvgUs (4) | cycleMaxUs (2) | freeRam (2) |
@@ -244,5 +244,16 @@
 //          menos por la red que repetir 'style=...' en cada <p>. Los
 //          colores sueltos inline se sustituyeron por clases (.err/.ok/
 //          .warn/.mono/.mega/.esp/.lvl-*) definidas ahi.
+//   - v0.13 (2026-08-03): ESP_FW_VERSION_MINOR 9->10. Sin constantes
+//     nuevas en este header; cambios en esp8266_wifi.ino y web_assets.h:
+//     el formulario de configuracion ahora puede escanear las redes WiFi
+//     visibles (boton "Buscar redes WiFi" -> GET /scan, que devuelve JSON
+//     con SSID/RSSI/cifrado) y rellenar cualquiera de los 3 huecos de red
+//     con un clic, en vez de tener que escribir el SSID a mano. La logica
+//     vive en un app.js nuevo (mismo tratamiento gzip+PROGMEM que ya tenia
+//     el CSS, servido en /app.js). Si el ESP esta en modo AP fallback,
+//     /scan activa la interfaz STA solo durante el escaneo y vuelve al
+//     modo anterior al terminar, para no interrumpir a los clientes ya
+//     conectados al AP mas de lo estrictamente necesario.
 
 #endif // Z21_PROTOCOL_H
