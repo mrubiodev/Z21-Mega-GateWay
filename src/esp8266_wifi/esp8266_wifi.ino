@@ -256,12 +256,15 @@ uint8_t cfgMacAddr[EEPROM_ADDR_MAC_LEN] = {0, 0, 0, 0, 0, 0};
 // TODO: fijo por ahora a proposito (no se toca el Mega, que esta con otros
 // procesos). Mas adelante: generar una password aleatoria por placa y
 // mostrarla en la pantalla del Mega, en vez de tenerla fija en el firmware.
-// OJO: WPA2 exige minimo 8 caracteres -- "z21" tiene 3, asi que
-// WiFi.softAP() lo va a rechazar y el AP saldra ABIERTO (sin cifrado) en
-// vez de con esta password. Se deja tal cual porque es lo pedido para
-// esta fase; hay que alargarla (o generarla) antes de considerar esto
-// definitivo.
-#define AP_FIXED_PASSWORD "z21"
+//
+// "z21" (3 caracteres) que se uso al principio NO llegaba al minimo de 8
+// que exige WPA2 -- WiFi.softAP() lo rechazaba en silencio y el AP salia
+// ABIERTO en la practica, sin ningun cifrado. Se alargo a "z21admin" (8
+// caracteres) reutilizando el mismo valor por defecto que ya existia para
+// la password del portal web (cfgWebPass) en vez de inventar un secreto
+// nuevo -- sigue siendo temporal/fijo tal como se pidio, pero ahora si
+// cifra la red de verdad.
+#define AP_FIXED_PASSWORD "z21admin"
 // Cada cuanto, estando en modo AP, se reintenta conectar a alguna de las
 // redes STA guardadas (por si vuelve a estar disponible). No se hace mas
 // a menudo para no cortar a los clientes ya conectados al AP demasiado
@@ -1120,6 +1123,34 @@ void handleAppJs() {
   webServer.send_P(200, "application/javascript", (const char *)APP_JS_GZIP, APP_JS_GZIP_LEN);
 }
 
+// Escapa un String para poder meterlo dentro de HTML, tanto en contenido
+// de texto (<p>...</p>) como dentro de un atributo entre comillas simples
+// (value='...') -- por eso escapa tambien la comilla simple, no solo & < >.
+//
+// Por que hace falta esto: varios valores que se reinsertan en las
+// paginas del portal NO los escribe el dueño del ESP a mano -- el SSID
+// que aparece en "Red conectada" o el que se guarda al pulsar "Red 1/2/3"
+// en el buscador (ver /scan) es el nombre que OTRO ROUTER (de un vecino,
+// por ejemplo) decidio ponerse. Sin escapar, un SSID con una comilla
+// rompe el atributo value='...' del formulario, y uno con <script> se
+// ejecutaria sin mas al abrir tu propio /log o / -- self-XSS, pero real.
+String htmlEscape(const String &in) {
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
 // Escapa un String para poder meterlo como valor string dentro de JSON
 // (comillas y backslash escapados, caracteres de control fuera). Los SSID
 // normalmente no llevan nada raro, pero nada impide que alguien ponga
@@ -1362,7 +1393,7 @@ void handleRoot() {
   html += "<p>Firmware ESP: v" + String(ESP_FW_VERSION_MAJOR) + "." + String(ESP_FW_VERSION_MINOR) + "</p>";
   html += "<p>Modo actual: " + String(isAPMode ? "AP (fallback)" : "STA (conectado)") + "</p>";
   if (!isAPMode) {
-    html += "<p>Red conectada: " + WiFi.SSID() + "</p>";
+    html += "<p>Red conectada: " + htmlEscape(WiFi.SSID()) + "</p>";
   }
   html += "<p>IP: " + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "</p>";
   html += "<p>RSSI: " + String(isAPMode ? 0 : WiFi.RSSI()) + " dBm</p>";
@@ -1416,7 +1447,7 @@ void handleRoot() {
   html += "<i>(tarda unos segundos; pulsa \"Red 1/2/3\" junto a la que quieras para rellenar ese hueco)</i></p>";
   html += "<div id='scanResults'></div>";
   for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
-    html += "Red " + String(i + 1) + " - SSID: <input id='ssid" + String(i + 1) + "' name='ssid" + String(i + 1) + "' value='" + String(cfgSSID[i]) + "'> ";
+    html += "Red " + String(i + 1) + " - SSID: <input id='ssid" + String(i + 1) + "' name='ssid" + String(i + 1) + "' value='" + htmlEscape(String(cfgSSID[i])) + "'> ";
     html += "Password: <input name='pass" + String(i + 1) + "' type='password'> ";
     html += "<i>(dejar en blanco para no cambiarla)</i><br>";
   }
@@ -1437,7 +1468,7 @@ void handleRoot() {
   generateDefaultMac(defMac);
   char defTail[9];
   snprintf(defTail, sizeof(defTail), "%02X:%02X:%02X", defMac[3], defMac[4], defMac[5]);
-  html += String(defTail) + "): <input name='mac' value='" + macFieldValue + "' placeholder='AA:BB:CC:DD:EE:FF'><br>";
+  html += String(defTail) + "): <input name='mac' value='" + htmlEscape(macFieldValue) + "' placeholder='AA:BB:CC:DD:EE:FF'><br>";
   html += "<a href='/?genmac=1'>Generar MAC aleatoria (84:2B:BC:xx:xx:xx)</a> (revisa el campo y pulsa Guardar para aplicarla; evita colisiones con otros equipos de la red. Si quieres otro prefijo, escribelo tu directamente en el campo)<br>";
 
   // Usuario/password de ACCESO a este portal (checkWebAuth()). Antes no
@@ -1447,7 +1478,7 @@ void handleRoot() {
   // fuera del portal por una errata al escribirla -- si no coinciden, se
   // ignora el cambio y se mantiene la anterior (ver handleSave()).
   html += "<h3>Acceso al portal</h3>";
-  html += "<p>Usuario: <input name='webuser' value='" + String(cfgWebUser) + "'></p>";
+  html += "<p>Usuario: <input name='webuser' value='" + htmlEscape(String(cfgWebUser)) + "'></p>";
   html += "<p>Password nueva: <input name='webpass' type='password'> ";
   html += "Repetir: <input name='webpass2' type='password'> ";
   html += "<i>(dejar ambas en blanco para no cambiarla)</i></p>";
@@ -1511,8 +1542,9 @@ void handleLog() {
       if (evLog[idx].level < minLevel) continue;
       if (!first) json += ",";
       first = false;
-      // Escape minimo de comillas/backslash -- los textos los generamos
-      // nosotros mismos con evLogf(), no vienen de entrada de usuario.
+      // Escape minimo de comillas/backslash para que el JSON no se rompa
+      // (esto es para el propio JSON, no para HTML -- ver htmlEscape() en
+      // la vista normal de esta pagina para ese otro caso).
       String text = evLog[idx].text;
       text.replace("\\", "\\\\");
       text.replace("\"", "\\\"");
@@ -1551,7 +1583,7 @@ void handleLog() {
     html += "<span class='" + String(evLogLevelClass(evLog[idx].level)) + "'>";
     html += "[+" + String(ageMs / 1000) + "." + String((ageMs % 1000) / 100) + "s] ";
     html += "[" + String(evLogLevelName(evLog[idx].level)) + "] ";
-    html += evLog[idx].text;
+    html += htmlEscape(String(evLog[idx].text)); // ver htmlEscape(): el texto puede incluir un SSID ajeno (escaneo), no es todo generado por nosotros
     html += "</span>\n";
   }
   if (!any) {

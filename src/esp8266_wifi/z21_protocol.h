@@ -125,7 +125,7 @@
 #define MEGA_FW_VERSION_MAJOR 0
 #define MEGA_FW_VERSION_MINOR 8
 #define ESP_FW_VERSION_MAJOR 0
-#define ESP_FW_VERSION_MINOR 11
+#define ESP_FW_VERSION_MINOR 12
 
 // Payload del heartbeat (17 bytes, todo little-endian):
 //   uptimeMs (4) | cycleAvgUs (4) | cycleMaxUs (2) | freeRam (2) |
@@ -268,5 +268,21 @@
 //     archivo de backup lleva las passwords EN CLARO (es la unica forma
 //     de que el restore no requiera volver a teclearlas); el portal avisa
 //     de esto junto al enlace de descarga.
+//   - v0.15 (2026-08-04): ESP_FW_VERSION_MINOR 11->12. Sin constantes
+//     nuevas en este header; dos arreglos en esp8266_wifi.ino:
+//       1. htmlEscape(): varios valores que se reinsertan en las paginas
+//          del portal (SSID guardado o escaneado, usuario del portal,
+//          texto del log) no los escribe necesariamente el dueño del ESP
+//          -- un SSID ajeno con una comilla rompia el value='...' del
+//          formulario, y uno con <script> se habria ejecutado sin mas al
+//          ver el propio /log o / (self-XSS, pero real desde que existe
+//          el escaneo de redes en /scan). Se añadio htmlEscape() y se
+//          aplico en todos esos puntos.
+//       2. AP_FIXED_PASSWORD paso de "z21" (3 caracteres, por debajo del
+//          minimo de WPA2 -- el AP salia abierto en la practica) a
+//          "z21admin" (8 caracteres, reutilizando el mismo valor por
+//          defecto que ya existia para cfgWebPass en vez de inventar un
+//          secreto nuevo). Sigue siendo temporal/fijo, pero ahora cifra
+//          de verdad.
 
 #endif // Z21_PROTOCOL_H
