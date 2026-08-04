@@ -21,12 +21,27 @@
  * en docs/Z21_EMULATOR_SPEC.md sección 2 ("Serial1 o Serial2, libres").
  * No hace falta configurarlo aquí, la librería lo decide sola.
  *
+ * OJO, PREGUNTA FRECUENTE — DE/RE NO ES RX1/TX1: el UART de verdad
+ * (pines 18=TX1/19=RX1 del Mega) lo reserva y maneja la propia librería
+ * XpressNet en modo automático, sin que este backend tenga que
+ * configurarlo (ver el párrafo de arriba). El DE/RE del módulo MAX485 es
+ * OTRO pin, aparte del UART: es la línea que le dice al chip MAX485 si
+ * tiene que actuar como transmisor o como receptor en el bus half-duplex
+ * (en la mayoría de módulos MAX485 baratos los pines DE y RE físicos del
+ * chip vienen ya unidos en la placa, así que es un único cable/pin desde
+ * el Mega). La librería XpressNet es quien conmuta este pin sola
+ * (HIGH al transmitir, LOW al recibir) en cuanto se le pasa en su
+ * start(), este backend no tiene que tocarlo a mano en ningún sitio.
+ *
  * PENDIENTE DE HARDWARE (ver docs/Z21_EMULATOR_SPEC.md sección 12,
  * "Pendiente de
  * definir"): el pin exacto de DE/RE del MAX485 todavía no está fijado en
  * esta placa. TRACTION_XPRESSNET_DE_RE_PIN de abajo es un PLACEHOLDER —
  * verificar que no choca con el shield TFT/encoder/E-stop antes de
- * flashear con este backend activo.
+ * flashear con este backend activo. Ya no choca con los pines nuevos de
+ * input_config.h (E-stop=2, encoder A=3/B=21/botón=20): el placeholder
+ * actual (pin 4) queda libre de esos, pero confirmar contra el hardware
+ * real de todos modos.
  *
  * DIRECCIÓN PROPIA EN EL BUS: TRACTION_XPRESSNET_MY_ADDRESS (1-31, debe
  * ser única en el bus junto a la MultiMaus y cualquier otro cliente).
@@ -69,6 +84,48 @@
  *      entorno de trabajo); si al probar con la MultiMaus la posición
  *      informada no coincide con la aguja real, revisar primero aquí
  *      (setTurnout()/onTrnt() en el .cpp).
+ *   5) ACCESORIOS EXTENDIDOS (señales de más de 2 aspectos / DCCext según
+ *      RCN-213, LAN_X_SET_EXT_ACCESSORY, PDF sección 5.4): esto NO es una
+ *      asunción a validar, es una LIMITACIÓN CONOCIDA de esta v1 —
+ *      confirmada revisando la API pública de Digital-MoBa/XpressNet
+ *      (XpressNet.h en https://github.com/Digital-MoBa/XpressNet): la
+ *      librería es anterior a RCN-213/DCCext y solo expone setTrntPos()
+ *      para el paquete DCC "basic accessory decoder" de 2 salidas (PDF
+ *      sección 5.2) — no hay ningún método para construir o enviar el
+ *      paquete "extended accessory decoder" (DCCext) que necesita
+ *      LAN_X_SET_EXT_ACCESSORY, ni una forma de leer del bus el último
+ *      valor mandado a uno. Por tanto XpressNetTractionBackend::
+ *      setExtAccessory() en esta v1 SOLO actualiza el estado en RAM (ver
+ *      .cpp) — la app Z21 recibe una respuesta coherente y consistente,
+ *      pero NADA sale de verdad hacia la MultiMaus/vía para accesorios
+ *      extendidos. Para soportarlo de verdad hacen falta, en algún futuro
+ *      backend (o una versión propia/fork de la librería), o bien
+ *      construir el paquete DCCext a mano y encolarlo si la librería
+ *      expone algo de bajo nivel para inyectar tramas X-Bus arbitrarias
+ *      (no confirmado que lo haga), o bien esperar a que el propio
+ *      proyecto Digital-MoBa/XpressNet lo incorpore. Revisar aquí primero
+ *      si en el futuro se necesita cubrir señales de más de 2 aspectos
+ *      de verdad sobre hardware XpressNet real.
+ *   6) FUNCIONES F29-F68 (grupos 6-10 de LAN_X_SET_LOCO_FUNCTION_GROUP,
+ *      ampliación Z21 FW V1.42, ver FunctionGroup en traction_backend.h):
+ *      LIMITACIÓN CONOCIDA, no una asunción — Digital-MoBa/XpressNet es
+ *      anterior a esta ampliación y su API pública solo expone
+ *      setFunc0to4()/setFunc5to8()/setFunc9to12()/setFunc13to20()/
+ *      setFunc21to28(); no hay ningún setFunc29to36() ni equivalente. El
+ *      propio X-Bus clásico (Lenz) que habla esta librería con la
+ *      MultiMaus tampoco define un comando de grupo para F29 en
+ *      adelante — es una ampliación exclusiva del protocolo LAN de Z21,
+ *      no de X-Bus. Por eso setLocoFunctionGroup()/setLocoFunction() en
+ *      esta v1, para F29-F68, SOLO actualizan el LocoState en RAM (igual
+ *      que setExtAccessory() en el punto 5) — la app Z21 recibe una
+ *      respuesta coherente (incluido el byte extendido F29-F31 de
+ *      LAN_X_LOCO_INFO, ver sendLocoInfoResponse() en mega_z21.ino), pero
+ *      NADA sale hacia la MultiMaus/vía para estas funciones todavía.
+ *      Coherente además con el propio PDF (remark D de la tabla 4.3.2):
+ *      incluso en una Z21 real, F32-F68 tampoco llevan confirmación de
+ *      vuelta al cliente LAN, así que esta limitación no se nota desde
+ *      el punto de vista del protocolo — solo desde el punto de vista de
+ *      "¿de verdad se mueve algo en la vía?", que aquí es que no.
  */
 #ifndef TRACTION_BACKEND_XPRESSNET_H
 #define TRACTION_BACKEND_XPRESSNET_H
@@ -87,6 +144,7 @@
 #include "traction_backend.h"
 #include "loco_state_store.h"
 #include "accessory_state_store.h"
+#include "ext_accessory_state_store.h"
 
 #ifndef TRACTION_XPRESSNET_MY_ADDRESS
 #define TRACTION_XPRESSNET_MY_ADDRESS 30 // 1-31, único en el bus (ver docs/Z21_EMULATOR_SPEC.md sección 12)
@@ -113,10 +171,18 @@ public:
 
   void requestLocoRefresh(uint16_t addr) override;
   const LocoState *getLocoState(uint16_t addr) override;
+  void purgeLoco(uint16_t addr) override;
 
   void setTurnout(uint16_t addr, bool output, bool activate) override;
   void requestTurnoutRefresh(uint16_t addr) override;
   const AccessoryState *getTurnoutState(uint16_t addr) override;
+
+  // Ver punto 5 de "ASUNCIONES A VALIDAR" más arriba: en esta v1 solo
+  // actualizan el estado en RAM, no hay forma de mandar DCCext de verdad
+  // por el bus con esta librería.
+  void setExtAccessory(uint16_t rawAddr, uint8_t state) override;
+  void requestExtAccessoryRefresh(uint16_t rawAddr) override;
+  const ExtAccessoryState *getExtAccessoryState(uint16_t rawAddr) override;
 
   // --- Puente hacia los callbacks "weak" de la librería (ver .cpp) ---
   // Públicos porque los invocan funciones libres de espacio de nombres
@@ -133,6 +199,7 @@ private:
   TrackState track_;
   LocoStateStore locos_;
   AccessoryStateStore accessories_;
+  ExtAccessoryStateStore extAccessories_;
 };
 
 // Única instancia posible: la librería XpressNetClass usa un puntero

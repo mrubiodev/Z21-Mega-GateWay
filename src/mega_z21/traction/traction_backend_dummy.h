@@ -20,6 +20,7 @@
 #include "traction_backend.h"
 #include "loco_state_store.h"
 #include "accessory_state_store.h"
+#include "ext_accessory_state_store.h"
 
 class DummyTractionBackend : public ITractionBackend {
 public:
@@ -75,6 +76,25 @@ public:
       case FunctionGroup::F21toF28:
         loco->f21to28 = value;
         break;
+      // Grupos 6-10 (F29-F68, ver comentario en traction_backend.h): a
+      // diferencia de los grupos 1-5, aquí el byte del comando ya viene
+      // en orden bit0=función más baja tal cual, sin repartir entre dos
+      // grupos ni reordenar bits — se guarda directo.
+      case FunctionGroup::F29toF36:
+        loco->f29to36 = value;
+        break;
+      case FunctionGroup::F37toF44:
+        loco->f37to44 = value;
+        break;
+      case FunctionGroup::F45toF52:
+        loco->f45to52 = value;
+        break;
+      case FunctionGroup::F53toF60:
+        loco->f53to60 = value;
+        break;
+      case FunctionGroup::F61toF68:
+        loco->f61to68 = value;
+        break;
     }
   }
 
@@ -84,6 +104,10 @@ public:
 
   const LocoState *getLocoState(uint16_t addr) override {
     return locos_.findOrAlloc(addr);
+  }
+
+  void purgeLoco(uint16_t addr) override {
+    locos_.release(addr);
   }
 
   void setTurnout(uint16_t addr, bool output, bool activate) override {
@@ -106,11 +130,31 @@ public:
     return accessories_.findOrAlloc(addr);
   }
 
+  void setExtAccessory(uint16_t rawAddr, uint8_t state) override {
+    // Sin bus físico detrás: el valor mandado por la app pasa a ser el
+    // "último conocido" al instante, igual que hace setTurnout() con la
+    // posición. hasData=true a partir de aquí: ya sabemos con certeza
+    // qué es lo último que se le mandó a esta dirección.
+    ExtAccessoryState *ext = extAccessories_.findOrAlloc(rawAddr);
+    ext->state = state;
+    ext->hasData = true;
+  }
+
+  void requestExtAccessoryRefresh(uint16_t rawAddr) override {
+    (void)rawAddr; // no-op: el estado dummy ya está siempre al día
+  }
+
+  const ExtAccessoryState *getExtAccessoryState(uint16_t rawAddr) override {
+    return extAccessories_.findOrAlloc(rawAddr);
+  }
+
 private:
   // Aplica un cambio de una única función (LAN_X_SET_LOCO_FUNCTION). F0-F4
-  // usan el orden de bits especial de DB4 (ver traction_types.h); F5-F28
-  // son bit directo dentro de su byte. F29+ quedan fuera de esta tabla
-  // (no hay campo reservado para ellas todavía en LocoState).
+  // usan el orden de bits especial de DB4 (ver traction_types.h); F5-F68
+  // son bit directo dentro de su byte (bit0 = función más baja del
+  // grupo). TTNNNNNN solo tiene 6 bits de índice (PDF 4.3.1), así que en
+  // la práctica esta función nunca recibe index>63 por esa vía — F64-F68
+  // solo llegan por setLocoFunctionGroup(F61toF68), no por aquí.
   static void applySingleFunction(LocoState *loco, uint8_t index, FunctionOp op) {
     uint8_t *targetByte;
     uint8_t bitPos;
@@ -129,8 +173,18 @@ private:
       targetByte = &loco->f13to20; bitPos = index - 13;
     } else if (index <= 28) {
       targetByte = &loco->f21to28; bitPos = index - 21;
+    } else if (index <= 36) {
+      targetByte = &loco->f29to36; bitPos = index - 29;
+    } else if (index <= 44) {
+      targetByte = &loco->f37to44; bitPos = index - 37;
+    } else if (index <= 52) {
+      targetByte = &loco->f45to52; bitPos = index - 45;
+    } else if (index <= 60) {
+      targetByte = &loco->f53to60; bitPos = index - 53;
+    } else if (index <= 68) {
+      targetByte = &loco->f61to68; bitPos = index - 61;
     } else {
-      return; // F29+: fuera de alcance todavía
+      return; // fuera de rango (no debería llegar aquí, ver comentario arriba)
     }
     uint8_t mask = (uint8_t)(1 << bitPos);
     if (op == FunctionOp::Off) *targetByte &= ~mask;
@@ -141,6 +195,7 @@ private:
   TrackState track_;
   LocoStateStore locos_;
   AccessoryStateStore accessories_;
+  ExtAccessoryStateStore extAccessories_;
 };
 
 #endif // TRACTION_BACKEND_DUMMY_H

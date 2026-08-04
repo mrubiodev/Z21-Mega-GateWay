@@ -13,6 +13,11 @@
  * Historial de cambios:
  *   - v0.1 (2026-08-02): Creación inicial. Paleta y proporciones para la
  *     primera versión de la pantalla (apaisado, sin encoder).
+ *   - v0.2 (2026-08-04): HEADER_HEIGHT_RATIO 0.42->0.34 y LOG_MAX_LINES
+ *     8->24. El buffer de 8 líneas era el cuello de botella real (con el
+ *     shield de referencia sobraba hueco en pantalla para ~19 líneas
+ *     visibles y solo se aprovechaban 8) — ver comentarios junto a cada
+ *     constante para el cálculo completo.
  */
 
 #ifndef DISPLAY_THEME_H
@@ -58,17 +63,46 @@
 // Layout vertical: proporción de la pantalla (ya rotada a apaisado) que
 // ocupa la cabecera de estado; el resto, hasta el borde inferior, es el
 // panel de log de comunicación.
+//
+// 0.34 en vez del 0.42 original: la cabecera son 5 filas fijas (título +
+// 4 de estado, ver STATUS_ROW_COUNT en display_status_panel.cpp) con
+// texto de tamaño 1-2 (8-16 px) — con el shield de referencia del spec
+// (3.5" TFT, 320 px de alto en apaisado tras rotar, ver Z21_EMULATOR_
+// SPEC.md sección 9), 0.42 dejaba ~27 px por fila (mucho más margen del
+// que hace falta para texto de 8-16 px) a costa de restarle esa altura
+// al log. 0.34 deja ~22 px por fila —de sobra para leer cómodo— y le
+// devuelve esa diferencia al panel de log, que es donde de verdad hace
+// falta el espacio (ver AGENT.md, "facilitar evaluar si el sistema está
+// listo y comunicando sin cable USB"). Si en el futuro se usa un shield
+// de menos de ~280 px de alto, revisar aquí primero si las filas de la
+// cabecera se ven apretadas.
 // ---------------------------------------------------------------------
-#define HEADER_HEIGHT_RATIO 0.42f
+#define HEADER_HEIGHT_RATIO 0.34f
 
 // ---------------------------------------------------------------------
 // Panel de log: nº de líneas que se guardan en el buffer circular y
 // longitud máxima de cada línea (se trunca lo que no quepa). El nº de
 // líneas realmente VISIBLES a la vez se recalcula en tiempo de ejecución
-// según el alto real del panel (ver display_log_panel.cpp), por si este
-// shield concreto tiene menos resolución de la esperada.
+// según el alto real del panel (ver display_log_panel.cpp: g_maxVisibleLines
+// = min(lo que cabe en píxeles, LOG_MAX_LINES)), por si este shield
+// concreto tiene menos resolución de la esperada.
+//
+// LOG_MAX_LINES subido de 8 a 24: 8 NO era una limitación de espacio en
+// pantalla, era un límite del BUFFER que dejaba sin usar más de la mitad
+// del panel aunque hubiera sitio de sobra. Con el shield de referencia
+// (320 px de alto en apaisado) y HEADER_HEIGHT_RATIO=0.34 de arriba, el
+// panel de log tiene altura para unas 19 líneas visibles a la vez
+// (calculado como en displayLogPanelInit: alto_log / lineHeightPx, con
+// lineHeightPx=10 px a LOG_TEXT_SIZE=1) — con LOG_MAX_LINES=8 se estaban
+// desperdiciando más de 10 líneas de hueco visible en pantalla, que es
+// justo el síntoma reportado ("entran más líneas, ampliar para usar todo
+// el espacio disponible"). 24 deja margen incluso para un shield algo más
+// alto de lo esperado, sin que el buffer vuelva a ser el cuello de
+// botella. Coste en RAM: 24 * (LOG_LINE_MAXLEN+1) = 1176 bytes — sin
+// problema en los 8 KB de SRAM del Mega2560 (ver Z21_EMULATOR_SPEC.md
+// sección 4, "con ~50 locomotoras el consumo es del orden de pocos KB").
 // ---------------------------------------------------------------------
-#define LOG_MAX_LINES   8
+#define LOG_MAX_LINES   24
 #define LOG_LINE_MAXLEN 48
 
 #endif // DISPLAY_THEME_H

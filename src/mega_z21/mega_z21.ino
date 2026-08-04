@@ -54,6 +54,20 @@
  * contesta en unos segundos, seguimos igual en modo degradado — nunca
  * bloqueado esperando para siempre. Ver AGENT.md, "Sincronización inicial".
  *
+ * ENTRADAS FÍSICAS (input/input_config.h, input/encoder_input.h/.cpp):
+ * parada de emergencia por interrupción hardware y encoder rotativo con
+ * pulsador. NINGUNO de los dos está montado en el hardware actual — el
+ * código está completo y listo, pero solo se activa de verdad
+ * (pinMode/attachInterrupt) si su flag correspondiente
+ * (EMERGENCY_STOP_HARDWARE_PRESENT / ENCODER_HARDWARE_PRESENT, ambos en
+ * input_config.h) está en 1. La parada de emergencia usa una ISR mínima
+ * (solo pone un flag `volatile`) más una comprobación inmediata al
+ * principio de loop() — ver el razonamiento de por qué esto SÍ cumple
+ * "sin cola que pueda bloquearse" (AGENT.md, "Seguridad") en
+ * input_config.h. El encoder, de momento, solo vuelca sus eventos al log
+ * de pantalla (no hay menú real todavía, ver SCREEN_MODE_LOCO/CONFIG en
+ * display_types.h).
+ *
  * PANTALLA (display_*.h/.cpp, en esta misma carpeta): a partir de v0.5
  * el Mega pinta en la pantalla 3.5" TFT una cabecera con el estado del
  * enlace ESP, los datos de red, los contadores de frames y el estado
@@ -78,6 +92,10 @@
 #include "display/display_manager.h" // pantalla 3.5" TFT: estado + log de comunicación
                              // (ver AGENT.md, "Pantalla 3.5 TFT", y
                              // docs/Z21_EMULATOR_SPEC.md sección 9)
+#include "input/input_config.h" // pines/flags de parada de emergencia y encoder — ver ese
+                                 // fichero para el porqué de cada uno antes de tocar nada aquí
+#include "input/encoder_input.h" // encoder rotativo + pulsador (ver input_config.h,
+                                  // ENCODER_HARDWARE_PRESENT — API no-op si no está montado)
 
 // El núcleo Z21 de este sketch habla SOLO con `traction` (ITractionBackend,
 // ver traction_backend.h) — de qué backend concreto se trate se decide en
@@ -132,6 +150,29 @@ uint8_t framesRxOk = 0;
 uint8_t framesRxBad = 0;
 bool everReceivedGoodZ21Frame = false; // true en cuanto llega el primer Z21 válido; nunca se resetea
 unsigned long totalRawBytesFromESP = 0; // TODO byte recibido, haya frame o no
+
+// ---------------------------------------------------------------------
+// Parada de emergencia física (seta) — ver AGENT.md, sección "Seguridad"
+// (no negociable) y el razonamiento completo en input_config.h.
+// ---------------------------------------------------------------------
+//
+// La ISR NO llama a handleXSetStop() directamente. Hace lo mínimo posible
+// (poner este flag a true) y deja que loop() actúe de inmediato en la
+// siguiente vuelta — ver el porqué detallado en input_config.h, no es
+// "pasar por una cola que puede bloquearse", es evitar Serial3.write()/SPI
+// de la pantalla dentro de un contexto de interrupción.
+volatile bool emergencyStopTriggered = false;
+volatile unsigned long lastEmergencyStopIsrMs = 0;
+
+void estopISR() {
+  // Antirrebote mínimo dentro de la propia ISR: millis() es seguro de
+  // leer aquí (es un contador global que ya se actualiza por su propio
+  // timer interrupt, no hay I/O ni asignación de memoria implicada).
+  unsigned long now = millis();
+  if (now - lastEmergencyStopIsrMs < EMERGENCY_STOP_DEBOUNCE_MS) return;
+  lastEmergencyStopIsrMs = now;
+  emergencyStopTriggered = true;
+}
 
 void sendFrameToESP(uint8_t type, const uint8_t *payload, uint8_t len) {
   uint8_t chk = type ^ len;
@@ -528,7 +569,7 @@ void handleSystemStateGetData() {
   data[12] = buildCentralStateByte();
   data[13] = 0x00;
   data[14] = 0x00;
-  data[15] = CAP_DCC | CAP_LOCO_CMDS;
+  data[15] = CAP_DCC | CAP_LOCO_CMDS | CAP_ACCESSORY_CMDS;
   sendDataset(LAN_SYSTEMSTATE_DATACHANGED, data, 16);
 }
 
@@ -563,15 +604,19 @@ void handleXGetStatus() {
 // 0xF1 en handleDataset(), así que caía en el 'default' y NO se contestaba
 // nada. Es el candidato más probable para el aviso "central extranjera
 // detectada": una app que hace esta petición y nunca recibe respuesta
-// tiene un motivo objetivo para desconfiar de la central. Se usa la misma
-// versión dummy "V1.40" ya declarada en handleGetHwInfo() para ser
-// consistentes entre los dos comandos de versión.
+// tiene un motivo objetivo para desconfiar de la central. V1.42 para ser
+// COHERENTE con la versión ya declarada en handleGetHwInfo() (AGENT.md
+// insiste en que todo el handshake debe responder de forma coherente
+// entre sí) — antes decía V1.40 aquí y V1.42 en HWINFO, inconsistencia
+// que ya existía y que además ahora importa de verdad: el byte extendido
+// F29-F31 de LAN_X_LOCO_INFO (ver sendLocoInfoResponse) solo tiene
+// sentido declarando FW>=1.42 (PDF sección 4.4).
 void handleXGetFirmwareVersion() {
   uint8_t x[5];
   x[0] = 0xF3;
   x[1] = 0x0A;
   x[2] = 0x01; // V_MSB (BCD): "1"
-  x[3] = 0x40; // V_LSB (BCD): "40" -> V1.40
+  x[3] = 0x42; // V_LSB (BCD): "42" -> V1.42
   x[4] = xorChecksum(x, 4);
   sendXDataset(x, 5);
 }
@@ -604,7 +649,17 @@ void handleXSetTrackPowerOn() {
 }
 
 void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *loco) {
-  uint8_t x[10];
+  // Formato extendido (PDF 4.4): "Ab Z21 FW Version 1.42 ist DataLen >= 15
+  // (n >= 8), zur Übertragung des Status von F29, F30 und F31" — un
+  // noveno byte de datos (DB8) con F29 en el bit0, F30 en el bit1, F31 en
+  // el bit2 (resto reservado/0). Es justo lo que guarda el bit0-2 de
+  // loco->f29to36 (mismo orden que la tabla del grupo 6, ver
+  // traction_types.h), así que basta con enmascarar. Es SOLO F29-F31: el
+  // propio PDF (remark D de la tabla 4.3.2) dice que F32 en adelante NO
+  // llevan confirmación de vuelta al cliente LAN ni en una Z21 real, así
+  // que f37to44 en adelante NUNCA se mandan aquí aunque LocoState los
+  // guarde para uso interno.
+  uint8_t x[11];
   x[0] = 0xEF; // X-Header LAN_X_LOCO_INFO
   x[1] = adrMsbRaw; // la app ignora los 2 bits altos, se devuelve tal cual se pidió
   x[2] = adrLsb;
@@ -614,8 +669,9 @@ void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *lo
   x[6] = loco->f5to12;
   x[7] = loco->f13to20;
   x[8] = loco->f21to28;
-  x[9] = xorChecksum(x, 9);
-  sendXDataset(x, 10);
+  x[9] = loco->f29to36 & 0x07; // DB8: solo bits F29-F31, resto a 0
+  x[10] = xorChecksum(x, 10);
+  sendXDataset(x, 11);
 }
 
 void handleXGetLocoInfo(const uint8_t *reqData, uint8_t reqLen) {
@@ -682,10 +738,32 @@ void handleXSetLocoDriveOrFunction(const uint8_t *data, uint8_t dataLen) {
   } else if (db0 == 0x28 && dataLen >= 5) {
     traction.setLocoFunctionGroup(addr, FunctionGroup::F21toF28, data[4]); // grupo 5
     displayLogf("Loco %u: F21-F28 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
+  } else if (db0 == 0x29 && dataLen >= 5) {
+    // Grupo 6 (F29-F36, PDF 4.3.2, ampliación Z21 FW V1.42). Con backend
+    // XpressNet esto SOLO actualiza el estado en RAM (ver punto 6 de
+    // "ASUNCIONES A VALIDAR" en traction_backend_xpressnet.h) — no hay
+    // forma de mandarlo por esta librería/X-Bus clásico hacia la
+    // MultiMaus. Se acepta y responde igual, coherente con el propio PDF
+    // (remark D: incluso una Z21 real no confirma F32+ al cliente LAN).
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F29toF36, data[4]);
+    displayLogf("Loco %u: F29-F36 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
+  } else if (db0 == 0x2A && dataLen >= 5) {
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F37toF44, data[4]); // grupo 7
+    displayLogf("Loco %u: F37-F44 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
+  } else if (db0 == 0x2B && dataLen >= 5) {
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F45toF52, data[4]); // grupo 8
+    displayLogf("Loco %u: F45-F52 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
+  } else if (db0 == 0x50 && dataLen >= 5) {
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F53toF60, data[4]); // grupo 9
+    displayLogf("Loco %u: F53-F60 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
+  } else if (db0 == 0x51 && dataLen >= 5) {
+    traction.setLocoFunctionGroup(addr, FunctionGroup::F61toF68, data[4]); // grupo 10
+    displayLogf("Loco %u: F61-F68 = 0x%02X", (unsigned)addr, (unsigned)data[4]);
   }
-  // TODO: grupos 6-10 (F29-F68, PDF 4.3.2) y LAN_X_SET_LOCO_BINARY_STATE
-  // (4.3.3) quedan fuera todavía — LocoState no tiene campo reservado
-  // para funciones >F28 (ver traction_types.h).
+  // LAN_X_SET_LOCO_BINARY_STATE (PDF 4.3.3, XHeader 0xE5) sigue sin
+  // implementar: no comparte XHeader con este comando (0xE4), así que no
+  // hace falta tocar esta función para él — haría falta un 'case' propio
+  // en el dispatcher principal si se implementa más adelante.
 
   const LocoState *updatedLoco = traction.getLocoState(addr);
   if (updatedLoco != nullptr) {
@@ -693,6 +771,52 @@ void handleXSetLocoDriveOrFunction(const uint8_t *data, uint8_t dataLen) {
     hasLastLocoState = true;
   }
   sendLocoInfoResponse(data[2], data[3], updatedLoco);
+}
+
+void handleXSetLocoEStop(const uint8_t *data, uint8_t dataLen) {
+  // Verificado contra el PDF (sección 4.5): la tabla de la petición tiene
+  // una errata en la cabecera de columnas ("DB0 DB2" en vez de "DB0 DB1"),
+  // pero los campos listados son inequívocos: XHeader(0x92)+Adr_MSB+
+  // Adr_LSB+XOR, 4 bytes de Data en total (DataLen=0x08). Sin respuesta
+  // estándar propia: el PDF remite a 4.4 LAN_X_LOCO_INFO "a los clientes
+  // suscritos", igual que ya hace este fichero con SET_LOCO_DRIVE.
+  if (dataLen < 3) return;
+  uint16_t addr = ((uint16_t)(data[1] & 0x3F) << 8) | data[2];
+  // El E-Stop es un valor de velocidad concreto (paso 1, "Notfall-Halt")
+  // dentro del mismo DB3 que usa LAN_X_SET_LOCO_DRIVE, NO un campo
+  // aparte — por eso se reutiliza setLocoDrive() en vez de añadir un
+  // método nuevo a ITractionBackend, conservando el sentido de marcha y
+  // el formato de pasos que ya tuviera la loco (el PDF no dice que el
+  // E-Stop cambie ninguno de los dos).
+  const LocoState *before = traction.getLocoState(addr);
+  uint8_t stepsCode = (before != nullptr) ? before->stepsCode : 4; // 128 pasos por defecto
+  uint8_t dirBit = (before != nullptr) ? (before->speedByte & 0x80) : 0x80; // adelante por defecto
+  traction.setLocoDrive(addr, stepsCode, dirBit | 0x01); // 0x01 = paso de velocidad E-Stop
+  displayLogf("Loco %u: E-STOP", (unsigned)addr);
+
+  const LocoState *updated = traction.getLocoState(addr);
+  if (updated != nullptr) {
+    lastLocoState = *updated;
+    hasLastLocoState = true;
+  }
+  sendLocoInfoResponse(data[1], data[2], updated);
+}
+
+void handleXPurgeLoco(const uint8_t *data, uint8_t dataLen) {
+  // Verificado contra el PDF (sección 4.6): comparte XHeader 0xE3 con
+  // LAN_X_GET_LOCO_INFO (ver dispatcher, que distingue por DB0: 0xF0=GET,
+  // 0x44=PURGE). Data: XHeader(0xE3)+DB0(0x44)+Adr_MSB+Adr_LSB+XOR, 5
+  // bytes en total (DataLen=0x09).
+  if (dataLen < 4) return;
+  uint16_t addr = ((uint16_t)(data[2] & 0x3F) << 8) | data[3];
+  traction.purgeLoco(addr);
+  displayLogf("Loco %u: purgada", (unsigned)addr);
+  // PDF: "There is no response to the caller and no notification to
+  // other clients" — a diferencia de todos los demás handlers de este
+  // fichero, aquí NO se manda ningún LAN_X_LOCO_INFO de vuelta.
+  if (hasLastLocoState && lastLocoState.address == addr) {
+    hasLastLocoState = false; // el snapshot de la cabecera también queda obsoleto
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -748,6 +872,57 @@ void handleXSetTurnout(const uint8_t *data, uint8_t dataLen) {
   // handleSetBroadcastFlags) y manda siempre la info actualizada.
   const AccessoryState *acc = traction.getTurnoutState(addr);
   sendTurnoutInfoResponse(data[1], data[2], acc);
+}
+
+// ---------------------------------------------------------------------
+// Accesorios EXTENDIDOS (señales de más de 2 aspectos, decodificadores
+// DCCext según RCN-213 — PDF sección 5.4-5.6). Direccionamiento DISTINTO
+// al de los turnouts normales de arriba: aquí 'addr' es la RawAddress de
+// RCN-213 tal cual, no el FAdr con conversión a puerto/salida — ver
+// ExtAccessoryState en traction_types.h para el detalle completo.
+// ---------------------------------------------------------------------
+void sendExtAccessoryInfoResponse(uint8_t adrMsb, uint8_t adrLsb, const ExtAccessoryState *ext) {
+  // Verificado contra el PDF (sección 5.6): X-Header 0x44, DB0=Adr_MSB,
+  // DB1=Adr_LSB, DB2=DDDDDDDD (estado), DB3=Status, XOR — 6 bytes.
+  uint8_t x[6];
+  x[0] = 0x44; // X-Header LAN_X_EXT_ACCESSORY_INFO
+  x[1] = adrMsb;
+  x[2] = adrLsb;
+  x[3] = ext->state;
+  x[4] = ext->hasData ? EXT_ACCESSORY_STATUS_VALID : EXT_ACCESSORY_STATUS_UNKNOWN;
+  x[5] = xorChecksum(x, 5);
+  sendXDataset(x, 6);
+}
+
+void handleXGetExtAccessoryInfo(const uint8_t *data, uint8_t dataLen) {
+  // Verificado contra el PDF (sección 5.5): XHeader(1)+DB0=Adr_MSB+
+  // DB1=Adr_LSB+DB2=0x00(reservado), sin más datos. DB2 se ignora tal
+  // cual dice el PDF ("reserved for future extensions").
+  if (dataLen < 3) return;
+  uint16_t rawAddr = ((uint16_t)data[1] << 8) | data[2];
+  traction.requestExtAccessoryRefresh(rawAddr);
+  const ExtAccessoryState *ext = traction.getExtAccessoryState(rawAddr);
+  sendExtAccessoryInfoResponse(data[1], data[2], ext);
+}
+
+void handleXSetExtAccessory(const uint8_t *data, uint8_t dataLen) {
+  // Verificado contra el PDF (sección 5.4): XHeader(1)+DB0=Adr_MSB+
+  // DB1=Adr_LSB+DB2=DDDDDDDD(estado)+DB3=0x00(reservado), sin más datos.
+  if (dataLen < 5) return;
+  uint16_t rawAddr = ((uint16_t)data[1] << 8) | data[2];
+  uint8_t state = data[3];
+  // data[4] (DB3) es el byte reservado del PDF, siempre 0x00 hasta
+  // nuevas versiones del protocolo — se ignora a propósito, igual que ya
+  // se ignora el bit Q de LAN_X_SET_TURNOUT más arriba.
+  traction.setExtAccessory(rawAddr, state);
+  displayLogf("Acc.ext %u: estado %u", (unsigned)rawAddr, (unsigned)state);
+  // PDF sección 5.4: "No standard answer, or 5.6 LAN_X_EXT_ACCESSORY_INFO
+  // to subscribed clients" — esta versión, igual que el resto de
+  // comandos de accesorios/tracción, no distingue clientes suscritos y
+  // manda siempre la info actualizada (ver comentario equivalente en
+  // handleXSetTurnout).
+  const ExtAccessoryState *ext = traction.getExtAccessoryState(rawAddr);
+  sendExtAccessoryInfoResponse(data[1], data[2], ext);
 }
 
 void handleXSetStop() {
@@ -1014,8 +1189,15 @@ void handleDataset(const uint8_t *payload, uint8_t len) {
             handleXSetTrackPowerOn();
           }
           break;
-        case 0xE3: // LAN_X_GET_LOCO_INFO
-          handleXGetLocoInfo(data, dataLen);
+        case 0xE3: // LAN_X_GET_LOCO_INFO (DB0=0xF0) / LAN_X_PURGE_LOCO (DB0=0x44) — comparten XHeader
+          if (dataLen >= 2 && data[1] == 0xF0) {
+            handleXGetLocoInfo(data, dataLen);
+          } else if (dataLen >= 2 && data[1] == 0x44) {
+            handleXPurgeLoco(data, dataLen);
+          }
+          break;
+        case 0x92: // LAN_X_SET_LOCO_E_STOP (PDF sección 4.5)
+          handleXSetLocoEStop(data, dataLen);
           break;
         case 0xF1: // LAN_X_GET_FIRMWARE_VERSION (PDF sección 2.15)
           if (dataLen >= 2 && data[1] == 0x0A) {
@@ -1030,6 +1212,12 @@ void handleDataset(const uint8_t *payload, uint8_t len) {
           break;
         case 0x53: // LAN_X_SET_TURNOUT (PDF sección 5.2)
           handleXSetTurnout(data, dataLen);
+          break;
+        case 0x44: // LAN_X_GET_EXT_ACCESSORY_INFO (PDF sección 5.5)
+          handleXGetExtAccessoryInfo(data, dataLen);
+          break;
+        case 0x54: // LAN_X_SET_EXT_ACCESSORY (PDF sección 5.4)
+          handleXSetExtAccessory(data, dataLen);
           break;
         case 0x80:
           // Verificado contra el PDF (sección 2.13): LAN_X_SET_STOP tiene
@@ -1102,13 +1290,31 @@ void setup() {
   displayLogF(F("Backend traccion: DUMMY (sin bus)"));
 #endif
 
-  // TODO: SD del shield (log de sesión + base de datos de locomotoras) y
-  //       encoder rotativo — no usado todavía, ver display_types.h
-  //       (DisplayScreenMode) para cómo se prevé encajar el encoder más
-  //       adelante sin rehacer el módulo de pantalla.
-  // TODO: inicializar interrupción del botón de parada de emergencia
-  //       (crítico, ver AGENT.md, "Seguridad" — no debe faltar antes de
-  //       probar con hardware real conectado a la vía).
+  // TODO: SD del shield (log de sesión + base de datos de locomotoras) —
+  //       sigue sin implementar, no usada todavía.
+
+  // Parada de emergencia física: ver input_config.h para el razonamiento
+  // completo (cableado NC fail-safe, antirrebote, por qué RISING). Solo
+  // se activa de verdad si EMERGENCY_STOP_HARDWARE_PRESENT es 1 — con la
+  // seta todavía sin conectar (caso actual), dejar esto en 0 evita que un
+  // pin flotante dispare una parada falsa en cada arranque.
+#if EMERGENCY_STOP_HARDWARE_PRESENT
+  pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(EMERGENCY_STOP_PIN), estopISR, RISING);
+  displayLogF(F("E-stop fisico: ACTIVO"));
+#else
+  displayLogF(F("E-stop fisico: no conectado (ver input_config.h)"));
+#endif
+
+  // Encoder rotativo + pulsador: no-op si ENCODER_HARDWARE_PRESENT es 0
+  // en input_config.h (ver encoder_input.cpp) — se llama siempre igual,
+  // así no hace falta ningún #if aquí.
+  encoderInit();
+#if ENCODER_HARDWARE_PRESENT
+  displayLogF(F("Encoder: ACTIVO"));
+#else
+  displayLogF(F("Encoder: no montado (ver input_config.h)"));
+#endif
 
   wdt_enable(WATCHDOG_TIMEOUT); // si loop() se cuelga, reset automático
 }
@@ -1116,6 +1322,20 @@ void setup() {
 void loop() {
   wdt_reset(); // "doy señales de vida" — si esto no se ejecuta en el
                // tiempo del timeout, el watchdog resetea el Mega solo
+
+  // Parada de emergencia: lo PRIMERO que hace loop(), antes de tocar el
+  // enlace con el ESP o la pantalla — ver el flag `volatile` y estopISR()
+  // más arriba, y el razonamiento completo en input_config.h. loop() da
+  // vueltas en microsegundos en este firmware, así que comprobar el flag
+  // aquí es, en la práctica, "inmediato" sin los riesgos de actuar desde
+  // dentro de la propia interrupción.
+  if (emergencyStopTriggered) {
+    noInterrupts();
+    emergencyStopTriggered = false;
+    interrupts();
+    handleXSetStop(); // ya hace traction.emergencyStopAll() + notifica LAN_X_BC_STOPPED + log
+    displayLogF(F("(disparada por boton fisico)"));
+  }
 
   trackCycleTime();
   traction.poll(); // no bloqueante: ver ITractionBackend::poll() en traction_backend.h
@@ -1129,6 +1349,22 @@ void loop() {
   // restaura la comunicación, así que el refresco en vivo de la cabecera
   // está reactivado (línea de abajo) — no volver a comentarla sin motivo.
   displayTick(buildDisplaySnapshot());
+
+  // Encoder: todavía no hay SCREEN_MODE_LOCO/CONFIG que consuma estos
+  // eventos (ver display_types.h), así que de momento solo se vuelcan al
+  // log de pantalla — sirve para confirmar que el cableado/sentido de
+  // giro son correctos en cuanto se monte, sin depender de tener ya un
+  // menú construido encima. No-op si ENCODER_HARDWARE_PRESENT es 0.
+  long encoderDelta = 0;
+  bool encoderButtonPressed = false;
+  if (encoderPoll(encoderDelta, encoderButtonPressed)) {
+    if (encoderDelta != 0) {
+      displayLogf("Encoder: %ld", encoderDelta);
+    }
+    if (encoderButtonPressed) {
+      displayLogF(F("Encoder: pulsado"));
+    }
+  }
 
   if (!synced) {
     runSyncStep(); // manda HELLO periódicamente hasta recibir NET_INFO

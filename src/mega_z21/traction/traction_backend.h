@@ -54,12 +54,26 @@ enum class FunctionOp : uint8_t {
 // tal cual, porque construirlo función a función en el núcleo Z21 solo
 // para desempaquetarlo otra vez dentro del backend no aporta nada; está
 // documentado grupo a grupo en cada backend concreto.
+//
+// Grupos 6-10 (F29-F68, ampliación Z21 FW V1.42, ver PDF tabla completa
+// en 4.3.2): el propio PDF distingue F29-F31 (remark C: "incluyendo
+// feedback a los clientes LAN") de F32-F68 (remark D: "SIN feedback a
+// los clientes LAN, los comandos DCC de función solo se mandan a la
+// vía") — por eso sendLocoInfoResponse() en mega_z21.ino solo añade el
+// byte extendido DB8 (F29-F31) a la respuesta, nunca F32 en adelante.
+// Remark E además dice explícitamente que ni siquiera está garantizado
+// que los decodificadores por debajo de F29 entiendan estos comandos.
 enum class FunctionGroup : uint8_t {
   F0toF4 = 1,
   F5toF8 = 2,
   F9toF12 = 3,
   F13toF20 = 4,
-  F21toF28 = 5
+  F21toF28 = 5,
+  F29toF36 = 6,
+  F37toF44 = 7,
+  F45toF52 = 8,
+  F53toF60 = 9,
+  F61toF68 = 10
 };
 
 class ITractionBackend {
@@ -94,7 +108,11 @@ public:
   // ver traction_types.h.
   virtual void setLocoDrive(uint16_t addr, uint8_t stepsCode, uint8_t speedByte) = 0;
 
-  // Cambia UNA función por índice (0=F0 ... 28=F28).
+  // Cambia UNA función por índice. TTNNNNNN (PDF 4.3.1) solo tiene 6 bits
+  // de índice, así que el propio formato del comando limita esto a 0-63
+  // (F0...F63) — F64-F68 solo son alcanzables vía SET_LOCO_FUNCTION_GROUP
+  // grupo 10 (F61toF68), nunca por esta vía. Ver FunctionGroup más arriba
+  // para las limitaciones de feedback de F29 en adelante.
   virtual void setLocoFunction(uint16_t addr, uint8_t index, FunctionOp op) = 0;
 
   // Cambia un grupo de funciones de una vez (ver comentario de
@@ -112,6 +130,20 @@ public:
   // el backend debe crear una entrada con los valores por defecto de
   // LocoState). Nunca bloquea esperando al bus.
   virtual const LocoState *getLocoState(uint16_t addr) = 0;
+
+  // Retira una locomotora del seguimiento activo (LAN_X_PURGE_LOCO, PDF
+  // 4.6). El PDF describe esto sobre todo desde el punto de vista de una
+  // central real ("deja de refrescar periódicamente sus comandos de
+  // tracción en la vía"); ninguno de nuestros backends v1 hace ese tipo
+  // de refresco periódico propio (XpressNet v1 manda comandos puntuales,
+  // no un bucle de refresco — ver traction_backend_xpressnet.cpp), así
+  // que aquí el efecto observable es: olvidar el último LocoState
+  // conocido, para que el siguiente LAN_X_GET_LOCO_INFO no arrastre datos
+  // de antes de la purga sino los valores por defecto (128 pasos, parada,
+  // sentido adelante, funciones a 0). Según el PDF, sin respuesta al
+  // llamante ni notificación a otros clientes — eso ya lo respeta
+  // mega_z21.ino en el handler, no hace falta que el backend lo sepa.
+  virtual void purgeLoco(uint16_t addr) = 0;
 
   // ---------------------------------------------------------------------
   // Accesorios (agujas, señales de 2 aspectos, desacopladores,
@@ -138,6 +170,35 @@ public:
   // el backend debe crear una entrada con los valores por defecto de
   // AccessoryState). Nunca bloquea esperando al bus.
   virtual const AccessoryState *getTurnoutState(uint16_t addr) = 0;
+
+  // ---------------------------------------------------------------------
+  // Accesorios EXTENDIDOS (señales de más de 2 aspectos, decodificadores
+  // DCCext según RCN-213 — LAN_X_SET_EXT_ACCESSORY, PDF Z21 sección 5.4).
+  // Interfaz deliberadamente paralela a la de turnouts normales (mismo
+  // patrón set/requestRefresh/getState), pero con tipos y direccionamiento
+  // propios — ver ExtAccessoryState en traction_types.h para el porqué de
+  // no reutilizar AccessoryState tal cual.
+  // ---------------------------------------------------------------------
+
+  // Manda el estado DDDDDDDD (0-255) a un decodificador de accesorios
+  // extendido (LAN_X_SET_EXT_ACCESSORY, PDF 5.4). rawAddr es la
+  // RawAddress según RCN-213, NO el FAdr con conversión a puerto/salida
+  // que usa setTurnout(). El significado de 'state' lo decide el
+  // decodificador receptor (aspecto de señal, tiempo de conmutación...).
+  virtual void setExtAccessory(uint16_t rawAddr, uint8_t state) = 0;
+
+  // Pide refrescar el estado de un accesorio extendido desde el bus real
+  // (LAN_X_GET_EXT_ACCESSORY_INFO, PDF 5.5). No-op en backends síncronos/
+  // dummy y también en backends que, aunque tengan bus físico, no puedan
+  // consultarlo de verdad (ver limitación documentada en
+  // traction_backend_xpressnet.h para la v1).
+  virtual void requestExtAccessoryRefresh(uint16_t rawAddr) = 0;
+
+  // Último estado conocido de un accesorio extendido (nunca null: si no
+  // existía, el backend debe crear una entrada con los valores por
+  // defecto de ExtAccessoryState — state=0, hasData=false). Nunca
+  // bloquea esperando al bus.
+  virtual const ExtAccessoryState *getExtAccessoryState(uint16_t rawAddr) = 0;
 };
 
 #endif // TRACTION_BACKEND_H
