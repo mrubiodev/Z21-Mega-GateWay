@@ -125,7 +125,7 @@
 #define MEGA_FW_VERSION_MAJOR 0
 #define MEGA_FW_VERSION_MINOR 8
 #define ESP_FW_VERSION_MAJOR 0
-#define ESP_FW_VERSION_MINOR 12
+#define ESP_FW_VERSION_MINOR 16
 
 // Payload del heartbeat (17 bytes, todo little-endian):
 //   uptimeMs (4) | cycleAvgUs (4) | cycleMaxUs (2) | freeRam (2) |
@@ -284,5 +284,82 @@
 //          defecto que ya existia para cfgWebPass en vez de inventar un
 //          secreto nuevo). Sigue siendo temporal/fijo, pero ahora cifra
 //          de verdad.
+//   - v0.16 (2026-08-04): ESP_FW_VERSION_MINOR 12->13. Sin constantes
+//     nuevas en este header; cambio solo en esp8266_wifi.ino: soporte OTA
+//     (ArduinoOTA) para poder actualizar el firmware por WiFi desde el
+//     IDE de Arduino, sin cable USB. El ESP aparece como "puerto de red"
+//     con hostname z21emulator-<chipid> (visible tambien en el estado del
+//     portal, /). Protegido con la misma password que el portal web
+//     (cfgWebPass) en vez de una credencial nueva -- si se cambia desde
+//     /save, se relee en el siguiente arranque (que ya ocurre solo tras
+//     guardar). setupOTA() se llama una vez en setup() tras levantar
+//     WiFi y el portal; ArduinoOTA.handle() se llama en cada loop().
+//   - v0.17 (2026-08-04): ESP_FW_VERSION_MINOR 13->14. Sin constantes
+//     nuevas en este header; dos cambios en esp8266_wifi.ino/web_assets.h:
+//       1. Password de OTA SEPARADA de la del portal (cfgOtaPass, nueva
+//          seccion de EEPROM propia -- EEPROM_ADDR_OTAPASS_VALID). El
+//          v0.16 original reutilizaba cfgWebPass para OTA; con dos
+//          privilegios tan distintos (ver/editar config vs. flashear
+//          firmware arbitrario) conviene que compartan password solo si
+//          se elige explicitamente, no por defecto. Editable desde /save
+//          igual que la del portal (doble campo para evitar typos),
+//          incluida en el backup/restore (campo "otaPass").
+//       2. Rediseño visual del portal: paleta de color (azul acero),
+//          cabecera y barra de nav con fondo solido, y cada bloque de
+//          contenido de las 4 paginas metido en un <div class='card'>
+//          (fondo blanco, borde suave, sombra ligera) en vez de texto
+//          plano corrido -- pageHead()/pageFoot() ahora abren y cierran
+//          tambien un contenedor .wrap centrado. Todo sigue viviendo en
+//          el mismo CSS comprimido en gzip de siempre (ver web_assets.h).
+//   - v0.18 (2026-08-05): ESP_FW_VERSION_MINOR 14->15. Sin constantes
+//     nuevas en este header; cambios en esp8266_wifi.ino/web_assets.h:
+//       1. REVISION de soporte multi-cliente. Hasta ahora una sola
+//          variable global (lastClientIP/lastClientPort) se sobreescribia
+//          con cada UDP entrante -- con un cliente Z21 conectado no se
+//          nota, pero con dos o mas a la vez la respuesta del Mega podia
+//          mandarse al cliente equivocado. Se sustituyo por una cola FIFO
+//          (replyQueue, CLIENT_REPLY_QUEUE_LEN=8): cada peticion
+//          reenviada al Mega empuja el cliente a la cola, cada respuesta
+//          Z21 del Mega hace pop del primero -- mejora real sobre "el
+//          ultimo que hablo", pero sigue siendo una heuristica: el
+//          framing ESP<->Mega no lleva identificador de cliente, y los
+//          mensajes de tipo BROADCAST del protocolo real (cambio de
+//          estado de una loco, alimentacion de via) deberian mandarse a
+//          TODOS los clientes con el flag correspondiente activo (ver
+//          LAN_SET_BROADCASTFLAGS), no solo al de la cabeza de la cola --
+//          eso NO esta implementado todavia, documentado como limitacion
+//          conocida (ver comentario grande junto a la cola en el .ino).
+//          Una solucion completa requeriria tocar el Mega para etiquetar
+//          sus respuestas con un indice de cliente.
+//       2. Panel /clients nuevo: lista los clientes Z21 vistos (IP, MAC
+//          si se puede resolver, ultima vez visto) y permite ponerles un
+//          nombre "amigable", persistido en EEPROM (nueva seccion,
+//          EEPROM_SIZE subio de 512 a 1024 para hacer sitio). Identidad
+//          por MAC cuando es posible (mismo dispositivo aunque le cambie
+//          la IP), con fallback a IP -- la MAC SOLO se puede resolver
+//          cuando el ESP esta en modo AP (via wifi_softap_get_station_info()
+//          del SDK); en modo STA (conectado al router de casa, el caso
+//          habitual) no hay API estandar para obtener la MAC de otro
+//          dispositivo de la red, asi que ese cliente se sigue solo por
+//          IP y se trata como "nuevo" si esa IP cambia (limitacion de
+//          plataforma). Los clientes con nombre puesto nunca se
+//          desalojan de la tabla (maximo MAX_TRACKED_CLIENTS=8), asi que
+//          siguen apareciendo como "Desconectado" en vez de desaparecer.
+//   - v0.19 (2026-08-05): ESP_FW_VERSION_MINOR 15->16. Sin constantes
+//     nuevas en este header; cambios solo en esp8266_wifi.ino, tras
+//     aclarar que MAX_TRACKED_CLIENTS/CLIENT_REPLY_QUEUE_LEN eran numeros
+//     arbitrarios (no limites de hardware/RAM):
+//       - MAX_TRACKED_CLIENTS: 8 -> 16 (registro de clientes /clients).
+//       - CLIENT_REPLY_QUEUE_LEN: 8 -> 16 (peticiones en vuelo hacia el Mega).
+//       - EEPROM_SIZE: 1024 -> 2048 para hacer sitio de sobra (mismo
+//         sector de flash de siempre, sin coste real).
+//       - WiFi.softAP() ahora fija max_connection=8 explicitamente -- ESE
+//         SI es un limite real de hardware/SDK del ESP8266 en modo AP (el
+//         core lo deja en 4 por defecto si no se especifica). Solo
+//         importa si el ESP hace de AP el mismo (fallback); en modo STA
+//         (conectado al router de casa) no aplica -- lo gestiona el router.
+//     El cuello de botella real para muchos clientes activos a la vez
+//     sigue siendo el enlace serie unico hacia el Mega, no ninguno de
+//     estos numeros -- documentado junto a CLIENT_REPLY_QUEUE_LEN.
 
 #endif // Z21_PROTOCOL_H
