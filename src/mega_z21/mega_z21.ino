@@ -122,6 +122,27 @@ bool hasLastLocoState = false;
 #define LINK_BUF_SIZE 256
 uint8_t linkBuf[LINK_BUF_SIZE];
 
+// ---------------------------------------------------------------------
+// Multi-cliente Z21 (v0.11) — ver el comentario grande junto a
+// Z21_MAX_CLIENTS/CLIENT_ID_NONE/BCFLAG_* en z21_protocol.h para el
+// diseño completo del client-id en el framing.
+// ---------------------------------------------------------------------
+// A qué cliente responder AHORA MISMO: se fija justo antes de
+// handleDataset() (ver loop()) con el client-id que venía en el frame del
+// ESP, y se vuelve a CLIENT_ID_NONE en cuanto termina — así cualquier cosa
+// que se dispare FUERA de atender una petición de red concreta (hoy, solo
+// el botón físico de e-stop) no se confunde con la última petición
+// atendida. sendDataset()/sendXDataset() (más abajo) siempre contestan a
+// currentReplyClientId.
+uint8_t currentReplyClientId = CLIENT_ID_NONE;
+
+// Flags de LAN_SET_BROADCASTFLAGS, uno por slot de cliente (mismo índice
+// que z21Clients[] en el ESP — ver AGENT.md, "el ESP no debe interpretar
+// contenido Z21": el Mega es quien decide a quién le interesa cada
+// broadcast, el ESP solo enruta por client-id). Todo a 0 al arrancar =
+// ningún cliente suscrito a nada todavía, coherente con la Z21 real.
+uint32_t clientBroadcastFlags[Z21_MAX_CLIENTS];
+
 // Throttle sencillo para no inundar el log circular de la pantalla si hay
 // una ráfaga de errores (mismo patrón que evLogThrottle() en
 // esp8266_wifi.ino, no tocar uno sin revisar el otro): un error real se
@@ -285,20 +306,61 @@ bool tryReadFrameFromESP(uint8_t &outType, uint8_t *buf, uint16_t maxLen, uint8_
 // ---------------------------------------------------------------------
 uint8_t respBuf[LINK_BUF_SIZE];
 
+// Construye y manda un dataset Z21 a UN cliente concreto (por su
+// client-id/slot). Antepone el byte de CLIENT_ID que exige el framing
+// desde v0.11 (ver z21_protocol.h) — el "DataLen" de 2 bytes que sigue es
+// el del protocolo Z21 real y NO incluye ese byte, solo la cabecera+data.
+//
+// targetClientId == CLIENT_ID_NONE: no hay a quién responder de verdad
+// (p.ej. el botón físico de e-stop no es respuesta a ninguna petición de
+// red) — no se manda nada al ESP en vez de mandar un client-id inválido.
+void sendDatasetToClient(uint8_t targetClientId, uint16_t header, const uint8_t *data, uint8_t dataLen) {
+  if (targetClientId == CLIENT_ID_NONE) return;
+  uint16_t total = 4 + dataLen; // DataLen Z21 incluye los 4 bytes de cabecera (header+len), no el client-id
+  if (total > LINK_BUF_SIZE - 1) return; // no debería pasar con los datasets que maneja este firmware; guarda de seguridad
+  respBuf[0] = targetClientId;
+  respBuf[1] = total & 0xFF;
+  respBuf[2] = (total >> 8) & 0xFF;
+  respBuf[3] = header & 0xFF;
+  respBuf[4] = (header >> 8) & 0xFF;
+  for (uint8_t i = 0; i < dataLen; i++) respBuf[5 + i] = data[i];
+  sendFrameToESP(FRAME_TYPE_Z21, respBuf, (uint8_t)(total + 1));
+}
+
+// Respuesta DIRECTA: al cliente que mandó el comando que se está
+// atendiendo ahora mismo (currentReplyClientId, fijado en loop() justo
+// antes de llamar a handleDataset()).
 void sendDataset(uint16_t header, const uint8_t *data, uint8_t dataLen) {
-  uint16_t total = 4 + dataLen; // DataLen incluye los 4 bytes de cabecera
-  respBuf[0] = total & 0xFF;
-  respBuf[1] = (total >> 8) & 0xFF;
-  respBuf[2] = header & 0xFF;
-  respBuf[3] = (header >> 8) & 0xFF;
-  for (uint8_t i = 0; i < dataLen; i++) respBuf[4 + i] = data[i];
-  sendFrameToESP(FRAME_TYPE_Z21, respBuf, (uint8_t)total);
+  sendDatasetToClient(currentReplyClientId, header, data, dataLen);
+}
+
+// BROADCAST: el mismo dataset a todos los clientes conocidos que tengan
+// el bit `flagBit` activo en su LAN_SET_BROADCASTFLAGS, salvo
+// excludeClientId (normalmente currentReplyClientId, para no duplicar la
+// respuesta directa que ya se mandó por sendDataset ahí donde aplica; pasar
+// CLIENT_ID_NONE si no hay que excluir a nadie, p.ej. el e-stop físico).
+//
+// El Mega no sabe aquí qué slots tienen de verdad un cliente conectado en
+// el ESP (esa tabla vive solo allí, ver AGENT.md) — simplemente se
+// recorren los Z21_MAX_CLIENTS slots posibles; un slot sin cliente real
+// nunca habrá tenido su flag activado (clientBroadcastFlags[i] == 0 por
+// defecto), así que el bucle no le manda nada y es inofensivo.
+void broadcastDataset(uint32_t flagBit, uint8_t excludeClientId, uint16_t header, const uint8_t *data, uint8_t dataLen) {
+  for (uint8_t i = 0; i < Z21_MAX_CLIENTS; i++) {
+    if (i == excludeClientId) continue;
+    if ((clientBroadcastFlags[i] & flagBit) == 0) continue;
+    sendDatasetToClient(i, header, data, dataLen);
+  }
 }
 
 // Un dataset LAN_X va dentro de un dataset con Header=0x40; xData ya debe
 // incluir el checksum final (XOR de XHeader..DBn).
 void sendXDataset(const uint8_t *xData, uint8_t xLen) {
   sendDataset(0x40, xData, xLen);
+}
+
+void broadcastXDataset(uint32_t flagBit, uint8_t excludeClientId, const uint8_t *xData, uint8_t xLen) {
+  broadcastDataset(flagBit, excludeClientId, 0x40, xData, xLen);
 }
 
 uint8_t xorChecksum(const uint8_t *data, uint8_t len) {
@@ -494,29 +556,27 @@ void handleGetCode() {
 
 // LAN_GET_BROADCASTFLAGS / LAN_SET_BROADCASTFLAGS (PDF oficial, secciones
 // 2.16-2.17): forman parte de la secuencia estándar de conexión de la
-// app. TODO: esta versión dummy no lleva un almacén real de flags por
-// cliente (IP+puerto) — se acepta cualquier SET sin más y el GET siempre
-// devuelve 0 (ningún broadcast activo). Cuando haya backend de tracción
-// real habrá que trackear esto por cliente para poder mandar de verdad
-// LAN_X_BC_* / LAN_SYSTEMSTATE_DATACHANGED como broadcast asíncrono, no
-// solo como respuesta a un GET explícito.
-// TODO real: por cliente (IP+puerto), como hace la librería de
-// referencia (Digital-MoBa/Z21, addIPToSlot/getLocalBcFlag) — de momento
-// un único valor global, suficiente mientras solo haya un cliente Z21
-// típico (la app) hablando con el ESP. Ya no está hardcodeado a 0: se
-// guarda de verdad lo último que la app mandó.
-uint32_t dummyBroadcastFlags = 0;
-
+// app. Desde v0.11 SÍ hay un almacén real de flags por cliente
+// (clientBroadcastFlags[], ver más arriba) indexado por el mismo
+// client-id/slot que usa el ESP en z21Clients[] — cada cliente guarda y
+// lee su propio valor, ya no comparten uno global. Solo BCFLAG_BASIC y
+// BCFLAG_SYSTEMSTATE (ver z21_protocol.h) provocan de verdad un envío en
+// este firmware; el resto de bits del PDF se aceptan y se guardan tal
+// cual (para que un GET posterior devuelva lo mismo que se mandó) pero no
+// disparan nada todavía.
 void handleSetBroadcastFlags(const uint8_t *data, uint8_t dataLen) {
   if (dataLen < 4) return;
-  dummyBroadcastFlags = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
-                         ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+  if (currentReplyClientId == CLIENT_ID_NONE) return; // no debería llegar aquí sin una petición de red detrás
+  clientBroadcastFlags[currentReplyClientId] =
+      (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+      ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
 }
 
 void handleGetBroadcastFlags() {
+  uint32_t flags = (currentReplyClientId == CLIENT_ID_NONE) ? 0 : clientBroadcastFlags[currentReplyClientId];
   uint8_t data[4] = {
-    (uint8_t)(dummyBroadcastFlags & 0xFF), (uint8_t)((dummyBroadcastFlags >> 8) & 0xFF),
-    (uint8_t)((dummyBroadcastFlags >> 16) & 0xFF), (uint8_t)((dummyBroadcastFlags >> 24) & 0xFF)
+    (uint8_t)(flags & 0xFF), (uint8_t)((flags >> 8) & 0xFF),
+    (uint8_t)((flags >> 16) & 0xFF), (uint8_t)((flags >> 24) & 0xFF)
   };
   sendDataset(LAN_GET_BROADCASTFLAGS, data, 4);
 }
@@ -631,7 +691,12 @@ void handleXSetTrackPowerOff() {
   traction.setTrackPower(false);
   uint8_t x[3] = { 0x61, 0x00, 0x00 };
   x[2] = xorChecksum(x, 2);
-  sendXDataset(x, 3); // LAN_X_BC_TRACK_POWER_OFF
+  // LAN_X_BC_TRACK_POWER_OFF es un broadcast real (PDF sección 2.5), no
+  // una respuesta directa a uno solo — mismo razonamiento que
+  // handleXSetStop: se manda a todos los clientes suscritos a
+  // BCFLAG_BASIC, sin excluir a nadie (el que lo pidió también lo espera
+  // si está suscrito, igual que cualquier otro).
+  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
   displayLogF(F("Track power OFF"));
 }
 
@@ -644,11 +709,12 @@ void handleXSetTrackPowerOn() {
   traction.setTrackPower(true);
   uint8_t x[3] = { 0x61, 0x01, 0x00 };
   x[2] = xorChecksum(x, 2);
-  sendXDataset(x, 3); // LAN_X_BC_TRACK_POWER_ON
+  // LAN_X_BC_TRACK_POWER_ON: broadcast real, mismo razonamiento que arriba.
+  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
   displayLogF(F("Track power ON"));
 }
 
-void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *loco) {
+uint8_t buildLocoInfoXData(uint8_t x[11], uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *loco) {
   // Formato extendido (PDF 4.4): "Ab Z21 FW Version 1.42 ist DataLen >= 15
   // (n >= 8), zur Übertragung des Status von F29, F30 und F31" — un
   // noveno byte de datos (DB8) con F29 en el bit0, F30 en el bit1, F31 en
@@ -659,7 +725,6 @@ void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *lo
   // llevan confirmación de vuelta al cliente LAN ni en una Z21 real, así
   // que f37to44 en adelante NUNCA se mandan aquí aunque LocoState los
   // guarde para uso interno.
-  uint8_t x[11];
   x[0] = 0xEF; // X-Header LAN_X_LOCO_INFO
   x[1] = adrMsbRaw; // la app ignora los 2 bits altos, se devuelve tal cual se pidió
   x[2] = adrLsb;
@@ -671,7 +736,24 @@ void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *lo
   x[8] = loco->f21to28;
   x[9] = loco->f29to36 & 0x07; // DB8: solo bits F29-F31, resto a 0
   x[10] = xorChecksum(x, 10);
+  return 11;
+}
+
+void sendLocoInfoResponse(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *loco) {
+  uint8_t x[11];
+  buildLocoInfoXData(x, adrMsbRaw, adrLsb, loco);
   sendXDataset(x, 11);
+}
+
+// Igual que sendLocoInfoResponse, pero para el resto de clientes
+// suscritos (BCFLAG_BASIC) tras un cambio real de la loco (SET_LOCO_DRIVE/
+// FUNCTION/E_STOP) — PDF 4.4/4.5: "a los clientes suscritos". NO se llama
+// desde handleXGetLocoInfo (una consulta no cambia nada, no hay nada que
+// notificar a nadie más).
+void broadcastLocoInfo(uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *loco, uint8_t excludeClientId) {
+  uint8_t x[11];
+  buildLocoInfoXData(x, adrMsbRaw, adrLsb, loco);
+  broadcastXDataset(BCFLAG_BASIC, excludeClientId, x, 11);
 }
 
 void handleXGetLocoInfo(const uint8_t *reqData, uint8_t reqLen) {
@@ -771,6 +853,9 @@ void handleXSetLocoDriveOrFunction(const uint8_t *data, uint8_t dataLen) {
     hasLastLocoState = true;
   }
   sendLocoInfoResponse(data[2], data[3], updatedLoco);
+  if (updatedLoco != nullptr) {
+    broadcastLocoInfo(data[2], data[3], updatedLoco, currentReplyClientId);
+  }
 }
 
 void handleXSetLocoEStop(const uint8_t *data, uint8_t dataLen) {
@@ -800,6 +885,9 @@ void handleXSetLocoEStop(const uint8_t *data, uint8_t dataLen) {
     hasLastLocoState = true;
   }
   sendLocoInfoResponse(data[1], data[2], updated);
+  if (updated != nullptr) {
+    broadcastLocoInfo(data[1], data[2], updated, currentReplyClientId);
+  }
 }
 
 void handleXPurgeLoco(const uint8_t *data, uint8_t dataLen) {
@@ -825,16 +913,32 @@ void handleXPurgeLoco(const uint8_t *data, uint8_t dataLen) {
 // las asunciones de conversión documentadas en traction_backend_
 // xpressnet.h/.cpp.
 // ---------------------------------------------------------------------
-void sendTurnoutInfoResponse(uint8_t adrMsb, uint8_t adrLsb, const AccessoryState *acc) {
+uint8_t buildTurnoutInfoXData(uint8_t x[5], uint8_t adrMsb, uint8_t adrLsb, const AccessoryState *acc) {
   // Verificado contra el PDF (sección 5.3): X-Header 0x43, DB0=AdrMSB,
   // DB1=AdrLSB, DB2=000000ZZ, XOR — 5 bytes en total.
-  uint8_t x[5];
   x[0] = 0x43; // X-Header LAN_X_TURNOUT_INFO
   x[1] = adrMsb;
   x[2] = adrLsb;
   x[3] = (uint8_t)acc->position & 0x03;
   x[4] = xorChecksum(x, 4);
+  return 5;
+}
+
+void sendTurnoutInfoResponse(uint8_t adrMsb, uint8_t adrLsb, const AccessoryState *acc) {
+  uint8_t x[5];
+  buildTurnoutInfoXData(x, adrMsb, adrLsb, acc);
   sendXDataset(x, 5);
+}
+
+// Igual que sendTurnoutInfoResponse, pero para el resto de clientes
+// suscritos (BCFLAG_BASIC) tras un SET_TURNOUT real — PDF 5.2: "No
+// standard answer, 5.3 LAN_X_TURNOUT_INFO to subscribed clients".
+// excludeClientId es normalmente currentReplyClientId, para no
+// duplicarle al que mandó el comando la respuesta directa que ya recibió.
+void broadcastTurnoutInfo(uint8_t adrMsb, uint8_t adrLsb, const AccessoryState *acc, uint8_t excludeClientId) {
+  uint8_t x[5];
+  buildTurnoutInfoXData(x, adrMsb, adrLsb, acc);
+  broadcastXDataset(BCFLAG_BASIC, excludeClientId, x, 5);
 }
 
 void handleXGetTurnoutInfo(const uint8_t *data, uint8_t dataLen) {
@@ -866,12 +970,13 @@ void handleXSetTurnout(const uint8_t *data, uint8_t dataLen) {
   displayLogf("Accesorio %u: salida %u %s", (unsigned)addr,
               output ? 2 : 1, activate ? "ON" : "OFF");
   // PDF sección 5.2: "Reply from Z21: No standard answer, 5.3
-  // LAN_X_TURNOUT_INFO to subscribed clients" — esta versión, igual que
-  // ya hace sendLocoInfoResponse tras LAN_X_SET_LOCO_DRIVE/FUNCTION, no
-  // distingue clientes suscritos vía broadcast flags (ver
-  // handleSetBroadcastFlags) y manda siempre la info actualizada.
+  // LAN_X_TURNOUT_INFO to subscribed clients" — desde v0.11 sí se
+  // distingue: respuesta directa al que mandó el comando (sendTurnoutInfoResponse)
+  // + broadcast al resto de clientes suscritos vía BCFLAG_BASIC
+  // (broadcastTurnoutInfo, ver handleSetBroadcastFlags).
   const AccessoryState *acc = traction.getTurnoutState(addr);
   sendTurnoutInfoResponse(data[1], data[2], acc);
+  broadcastTurnoutInfo(data[1], data[2], acc, currentReplyClientId);
 }
 
 // ---------------------------------------------------------------------
@@ -881,17 +986,31 @@ void handleXSetTurnout(const uint8_t *data, uint8_t dataLen) {
 // RCN-213 tal cual, no el FAdr con conversión a puerto/salida — ver
 // ExtAccessoryState en traction_types.h para el detalle completo.
 // ---------------------------------------------------------------------
-void sendExtAccessoryInfoResponse(uint8_t adrMsb, uint8_t adrLsb, const ExtAccessoryState *ext) {
+uint8_t buildExtAccessoryInfoXData(uint8_t x[6], uint8_t adrMsb, uint8_t adrLsb, const ExtAccessoryState *ext) {
   // Verificado contra el PDF (sección 5.6): X-Header 0x44, DB0=Adr_MSB,
   // DB1=Adr_LSB, DB2=DDDDDDDD (estado), DB3=Status, XOR — 6 bytes.
-  uint8_t x[6];
   x[0] = 0x44; // X-Header LAN_X_EXT_ACCESSORY_INFO
   x[1] = adrMsb;
   x[2] = adrLsb;
   x[3] = ext->state;
   x[4] = ext->hasData ? EXT_ACCESSORY_STATUS_VALID : EXT_ACCESSORY_STATUS_UNKNOWN;
   x[5] = xorChecksum(x, 5);
+  return 6;
+}
+
+void sendExtAccessoryInfoResponse(uint8_t adrMsb, uint8_t adrLsb, const ExtAccessoryState *ext) {
+  uint8_t x[6];
+  buildExtAccessoryInfoXData(x, adrMsb, adrLsb, ext);
   sendXDataset(x, 6);
+}
+
+// Igual que sendExtAccessoryInfoResponse, pero para el resto de clientes
+// suscritos (BCFLAG_BASIC) tras un SET_EXT_ACCESSORY real — mismo
+// razonamiento que broadcastTurnoutInfo, ver ahí.
+void broadcastExtAccessoryInfo(uint8_t adrMsb, uint8_t adrLsb, const ExtAccessoryState *ext, uint8_t excludeClientId) {
+  uint8_t x[6];
+  buildExtAccessoryInfoXData(x, adrMsb, adrLsb, ext);
+  broadcastXDataset(BCFLAG_BASIC, excludeClientId, x, 6);
 }
 
 void handleXGetExtAccessoryInfo(const uint8_t *data, uint8_t dataLen) {
@@ -917,19 +1036,27 @@ void handleXSetExtAccessory(const uint8_t *data, uint8_t dataLen) {
   traction.setExtAccessory(rawAddr, state);
   displayLogf("Acc.ext %u: estado %u", (unsigned)rawAddr, (unsigned)state);
   // PDF sección 5.4: "No standard answer, or 5.6 LAN_X_EXT_ACCESSORY_INFO
-  // to subscribed clients" — esta versión, igual que el resto de
-  // comandos de accesorios/tracción, no distingue clientes suscritos y
-  // manda siempre la info actualizada (ver comentario equivalente en
-  // handleXSetTurnout).
+  // to subscribed clients" — desde v0.11, igual que handleXSetTurnout:
+  // respuesta directa al que mandó el comando + broadcast al resto de
+  // suscritos.
   const ExtAccessoryState *ext = traction.getExtAccessoryState(rawAddr);
   sendExtAccessoryInfoResponse(data[1], data[2], ext);
+  broadcastExtAccessoryInfo(data[1], data[2], ext, currentReplyClientId);
 }
 
 void handleXSetStop() {
   traction.emergencyStopAll();
   uint8_t x[3] = { 0x81, 0x00, 0x00 };
   x[2] = xorChecksum(x, 2);
-  sendXDataset(x, 3); // LAN_X_BC_STOPPED
+  // LAN_X_BC_STOPPED es un broadcast real (PDF 2.13): a TODOS los
+  // clientes suscritos a BCFLAG_BASIC, no una respuesta directa a uno
+  // solo. No se excluye a nadie (CLIENT_ID_NONE como excludeClientId): si
+  // esto viene de un LAN_X_SET_STOP por red, el propio cliente que lo
+  // mandó también quiere/espera la confirmación si está suscrito, igual
+  // que cualquier otro; si viene del botón físico de e-stop,
+  // currentReplyClientId ya es CLIENT_ID_NONE (ver loop()) y no hay
+  // "quien lo pidió" que excluir en absoluto.
+  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
   displayLogF(F("*** PARADA DE EMERGENCIA ***"));
 }
 
@@ -944,12 +1071,14 @@ void handleCanDetector(const uint8_t *data, uint8_t dataLen) {
 }
 
 void handleGetCommunicationInfo() {
-  // Devuelve BroadcastFlags (4 bytes) + Puerto (2 bytes)
+  // Devuelve BroadcastFlags (4 bytes) + Puerto (2 bytes) — los flags del
+  // cliente que pregunta, no un valor global (ver clientBroadcastFlags[]).
+  uint32_t flags = (currentReplyClientId == CLIENT_ID_NONE) ? 0 : clientBroadcastFlags[currentReplyClientId];
   uint8_t data[8] = {
-    (uint8_t)(dummyBroadcastFlags & 0xFF), 
-    (uint8_t)((dummyBroadcastFlags >> 8) & 0xFF),
-    (uint8_t)((dummyBroadcastFlags >> 16) & 0xFF), 
-    (uint8_t)((dummyBroadcastFlags >> 24) & 0xFF),
+    (uint8_t)(flags & 0xFF),
+    (uint8_t)((flags >> 8) & 0xFF),
+    (uint8_t)((flags >> 16) & 0xFF),
+    (uint8_t)((flags >> 24) & 0xFF),
     0x69, 0x52, // Puerto 21105 en Little Endian (0x5269)
     0x00, 0x00
   };
@@ -1159,7 +1288,15 @@ void handleDataset(const uint8_t *payload, uint8_t len) {
       handleGetCode();
       break;
     case LAN_LOGOFF:
-      // Sin respuesta, ver spec
+      // Sin respuesta, ver spec. Sí limpiamos sus broadcast flags: un
+      // cliente que se desconecta explícitamente no debería seguir
+      // "recibiendo" (a nivel de a quién se le manda) broadcasts después
+      // de irse, y además mitiga parcialmente la reasignación de slot por
+      // LRU en el ESP (ver limitación documentada junto a Z21_MAX_CLIENTS
+      // en z21_protocol.h) para el caso de una desconexión ordenada.
+      if (currentReplyClientId != CLIENT_ID_NONE) {
+        clientBroadcastFlags[currentReplyClientId] = 0;
+      }
       break;
     case LAN_SET_BROADCASTFLAGS:
       handleSetBroadcastFlags(data, dataLen);
@@ -1399,10 +1536,18 @@ void loop() {
           // contarlo como error — todavía no hemos "levantado" el Z21.
           break;
         }
-        if (len >= 4) {
+        // Desde v0.11 el payload lleva 1 byte de CLIENT_ID delante del
+        // datagrama Z21 real (ver z21_protocol.h) — por eso el mínimo
+        // válido sube de 4 a 5 bytes. handleDataset() sigue recibiendo
+        // exactamente lo mismo que antes (el datagrama sin el client-id);
+        // currentReplyClientId es la única forma en que el resto del
+        // sketch se entera de a quién responder.
+        if (len >= 5) {
           framesRxOk = (framesRxOk < 255) ? framesRxOk + 1 : 255;
           everReceivedGoodZ21Frame = true;
-          handleDataset(linkBuf, len);
+          currentReplyClientId = linkBuf[0];
+          handleDataset(linkBuf + 1, len - 1);
+          currentReplyClientId = CLIENT_ID_NONE; // fuera de handleDataset() no hay "el que preguntó"
         } else {
           framesRxBad = (framesRxBad < 255) ? framesRxBad + 1 : 255;
           static unsigned long lastBadFrameLogMs = 0;

@@ -4,3 +4,4 @@
 #include "display/display_manager.cpp"
 #include "display/display_status_panel.cpp"
 #include "traction/traction_backend_xpressnet.cpp"
+#include "input/encoder_input.cpp"
