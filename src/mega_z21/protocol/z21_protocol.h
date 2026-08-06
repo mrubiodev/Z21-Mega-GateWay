@@ -36,6 +36,31 @@
 #define LAN_GET_COMMUNICATION_INFO 0x12
 
 #define LAN_CAN_DETECTOR 0xC4
+
+// Accesorios (agujas/señales de 2 aspectos/desacopladores/descarriladores
+// biestables) — PDF oficial sección 5 "Switching". Mismo XHeader 0x43
+// para la petición (5.1) y la respuesta (5.3): se distinguen por
+// DataLen/DB2, no por el XHeader.
+#define LAN_X_GET_TURNOUT_INFO 0x43
+#define LAN_X_TURNOUT_INFO 0x43
+#define LAN_X_SET_TURNOUT 0x53
+
+// Accesorios EXTENDIDOS (señales de más de 2 aspectos, decodificadores
+// DCCext según RCN-213) — PDF oficial secciones 5.4-5.6. Direccionamiento
+// DISTINTO al de LAN_X_(GET_)TURNOUT(_INFO) de arriba: aquí la dirección
+// es la RawAddress de RCN-213 tal cual (primer decodificador extendido =
+// RawAddress 4, mostrado como "dirección 1" en las UIs), sin la
+// conversión a puerto/salida que sí aplica la sección 5 a los turnouts
+// normales — ver ExtAccessoryState en traction_types.h. Igual que pasa
+// con 0x43 arriba, el XHeader 0x44 se reutiliza para la petición (5.5) y
+// la respuesta (5.6): se distinguen por DataLen, no por el XHeader.
+#define LAN_X_SET_EXT_ACCESSORY 0x54
+#define LAN_X_GET_EXT_ACCESSORY_INFO 0x44
+#define LAN_X_EXT_ACCESSORY_INFO 0x44
+
+// Byte "Status" de LAN_X_EXT_ACCESSORY_INFO (PDF sección 5.6, DB3)
+#define EXT_ACCESSORY_STATUS_VALID 0x00
+#define EXT_ACCESSORY_STATUS_UNKNOWN 0xFF
 // Headers de la secuencia de conexión/login (PDF oficial, secciones
 // 2.16-2.19). IMPORTANTE: el propio PDF dice literalmente que "el login
 // se hace de forma implícita con el primer comando del cliente (p.ej.
@@ -57,11 +82,20 @@
 
 // SystemState.Capabilities (PDF oficial sección 2.18, byte 15, definido
 // desde Z21 FW V1.42). Solo se listan los bits que realmente podemos
-// declarar con honestidad en esta versión dummy (DCC + comandos de
-// tracción por LAN); el resto (MM, RailCom, accesorios, detectores) NO se
-// marca porque no hay backend real para ellos todavía.
+// declarar con honestidad; el resto (MM, RailCom, detectores) NO se marca
+// porque no hay backend real para ellos todavía.
+// CAP_ACCESSORY_CMDS añadido junto con el soporte de LAN_X_(GET/SET)_
+// TURNOUT (agujas/señales de 2 aspectos) y LAN_X_(GET/SET)_EXT_ACCESSORY
+// (señales de más de 2 aspectos) — ambos aceptan y responden comandos LAN
+// de accesorios de forma coherente aunque, con backend XpressNet, los
+// extendidos todavía no lleguen de verdad al bus físico (ver limitación
+// documentada en traction_backend_xpressnet.h). El bit describe lo que
+// acepta el LAN de esta central, no si hay hardware detrás confirmando
+// cada comando — igual que CAP_LOCO_CMDS tampoco implica que haya una vía
+// con corriente real conectada.
 #define CAP_DCC 0x01
 #define CAP_LOCO_CMDS 0x10
+#define CAP_ACCESSORY_CMDS 0x20
 
 // -----------------------------------------------------------------------
 // Framing interno ESP<->Mega:
@@ -127,7 +161,7 @@
 // significativos en cada sketch.
 // -----------------------------------------------------------------------
 #define MEGA_FW_VERSION_MAJOR 0
-#define MEGA_FW_VERSION_MINOR 8
+#define MEGA_FW_VERSION_MINOR 11
 #define ESP_FW_VERSION_MAJOR 0
 #define ESP_FW_VERSION_MINOR 7
 
@@ -195,5 +229,48 @@
 //     solo en el log. No afecta a esp8266_wifi.ino ni al formato NetInfo
 //     por cable (ya llevaba la MAC desde v0.9, solo que el Mega no la
 //     pintaba todavia).
+//   - v0.11 (2026-08-04): MEGA_FW_VERSION_MINOR 8->9. Nuevas constantes
+//     LAN_X_GET_TURNOUT_INFO/LAN_X_TURNOUT_INFO/LAN_X_SET_TURNOUT (PDF
+//     seccion 5, "Switching") -- primer soporte de accesorios (agujas,
+//     senales de 2 aspectos, desacopladores, descarriladores biestables:
+//     todos son el mismo decodificador de accesorios DCC de 2 salidas a
+//     nivel de protocolo Z21). Nuevo AccessoryState en traction_types.h,
+//     nuevos metodos setTurnout/requestTurnoutRefresh/getTurnoutState en
+//     ITractionBackend, implementados en ambos backends (Dummy y
+//     XpressNet). Senales de mas de 2 aspectos (LAN_X_SET_EXT_ACCESSORY,
+//     PDF seccion 5.4) quedan fuera todavia. No afecta a esp8266_wifi.ino
+//     (el ESP sigue sin interpretar el contenido Z21).
+//   - v0.12 (2026-08-04): MEGA_FW_VERSION_MINOR 9->10. Nuevas constantes
+//     LAN_X_SET_EXT_ACCESSORY/LAN_X_GET_EXT_ACCESSORY_INFO/LAN_X_EXT_
+//     ACCESSORY_INFO y EXT_ACCESSORY_STATUS_* (PDF secciones 5.4-5.6,
+//     RCN-213) -- soporte de senales de mas de 2 aspectos, ultimo hueco
+//     del capitulo 5 "Switching" del protocolo. Nuevo ExtAccessoryState
+//     en traction_types.h (tabla separada de AccessoryState: direcciones
+//     RawAddress de RCN-213, espacio distinto al FAdr de los turnouts
+//     normales) y nuevo ExtAccessoryStateStore. Nuevos metodos
+//     setExtAccessory/requestExtAccessoryRefresh/getExtAccessoryState en
+//     ITractionBackend, implementados en Dummy (estado en RAM, siempre al
+//     dia) y en XpressNet (TAMBIEN solo estado en RAM en esta v1: la
+//     libreria Digital-MoBa/XpressNet es anterior a RCN-213/DCCext y no
+//     tiene forma de mandar este paquete por el bus fisico -- ver
+//     limitacion documentada explicitamente en traction_backend_
+//     xpressnet.h, punto 5 de "ASUNCIONES A VALIDAR"). Tambien se anade
+//     CAP_ACCESSORY_CMDS a SystemState.Capabilities (LAN_
+//     SYSTEMSTATE_DATACHANGED) -- ya se aceptaban comandos de turnout
+//     desde v0.11 y no se habia marcado el bit correspondiente. No afecta
+//     a esp8266_wifi.ino.
+//   - v0.13 (2026-08-04): MEGA_FW_VERSION_MINOR 10->11. Cierra el capitulo
+//     4 "Driving" de la lista v1 del spec: LAN_X_SET_LOCO_E_STOP (0x92,
+//     PDF 4.5) y LAN_X_PURGE_LOCO (XHeader 0xE3 compartido con LAN_X_
+//     GET_LOCO_INFO, distinguido por DB0=0x44 vs 0xF0, PDF 4.6). Nuevo
+//     metodo purgeLoco() en ITractionBackend y release() en
+//     LocoStateStore (liberar el slot de una direccion). Sin constantes
+//     nuevas en este header: los XHeader/DB0 involucrados (0x92, 0xF0,
+//     0x44 dentro de 0xE3) siguen el estilo ya establecido del proyecto
+//     de literal+comentario en el dispatcher de mega_z21.ino en vez de
+//     macro, igual que 0x21/0xE3/0xF1/0xE4/0x43/0x53 de mas arriba -- ver
+//     mega_z21.ino para el detalle. No afecta a esp8266_wifi.ino (el
+//     sniffer ya decodifica LAN_X de forma generica por XHeader, sin
+//     necesitar una entrada por comando).
 
 #endif // Z21_PROTOCOL_H

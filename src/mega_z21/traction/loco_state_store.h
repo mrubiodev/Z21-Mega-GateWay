@@ -60,6 +60,23 @@ public:
     return nullptr;
   }
 
+  // Libera el slot de una dirección si existe (LAN_X_PURGE_LOCO, PDF
+  // 4.6): lo devuelve a los valores por defecto de LocoState, incluyendo
+  // address=0 (slot libre de nuevo) — así la próxima consulta a esa
+  // dirección arranca de cero en vez de arrastrar el último estado
+  // conocido antes de la purga. No-op si la dirección no estaba en la
+  // tabla (findOrAlloc() la creará igualmente la próxima vez que haga
+  // falta, ver PDF: "sending will start again as soon as a new drive or
+  // function command is sent to the same locomotive address").
+  void release(uint16_t addr) {
+    for (uint8_t i = 0; i < MAX_TRACKED_LOCOS; i++) {
+      if (slots_[i].address == addr) {
+        slots_[i] = LocoState();
+        return;
+      }
+    }
+  }
+
 private:
   LocoState slots_[MAX_TRACKED_LOCOS];
 };

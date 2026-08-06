@@ -34,7 +34,8 @@ Base de partida: **`Digital-MoBa/DCCInterfaceMaster`** ("Arduino Z21 Digital Zen
 
 ### v2 (ampliación hacia el 100%)
 - `LAN_X_CV_READ`, `LAN_X_CV_WRITE`, `LAN_X_CV_POM_WRITE_BYTE/BIT`
-- `LAN_X_GET_TURNOUT_INFO`, `LAN_X_SET_TURNOUT`
+- ~~`LAN_X_GET_TURNOUT_INFO`, `LAN_X_SET_TURNOUT`~~ — **implementado (ver sección 5c)**
+- `LAN_X_SET_EXT_ACCESSORY` (señales de más de 2 aspectos, PDF sección 5.4) — pendiente
 - `LAN_GET_LOCOMODE` / `LAN_SET_LOCOMODE`
 - `LAN_RMBUS_GETDATA` / `LAN_RMBUS_DATACHANGED` (si se añaden detectores de ocupación)
 - `LAN_X_PURGE_LOCO`
@@ -46,6 +47,11 @@ Por cada locomotora activa:
 - Velocidad + sentido de marcha
 - Formato de pasos (14/28/128)
 - Funciones F0–F28 (bitfield de 32 bits)
+
+Por cada accesorio activo (agujas, señales de 2 aspectos, desacopladores,
+descarriladores biestables — ver sección 5c):
+- Dirección (16 bits, sin enmascarar)
+- Posición conocida (no conmutada / salida 1 / salida 2 / inválida)
 
 Estado global:
 - Track power on/off
@@ -73,6 +79,46 @@ Al probar el primer MVP (WiFi + web funcionando pero la app Z21 sin encontrar el
 - **Heartbeat**: el Mega manda cada 1s un frame de diagnóstico (uptime, tiempo de ciclo medio/máximo, RAM libre, contadores de frames Z21 OK/error). El ESP lo usa para saber si el Mega está vivo (timeout 3s sin heartbeat = "sin respuesta") y lo muestra en la web de configuración.
 - **Watchdog**: el Mega tiene un watchdog hardware (timeout 4s) que lo autorresetea si `loop()` se cuelga, en vez de quedarse colgado en silencio.
 - **Framing actualizado**: el enlace Mega↔ESP pasa de `[LEN][payload]` a `[TYPE(1)][LEN(1)][payload]`, donde TYPE distingue un datagrama Z21 real de un frame de heartbeat (que nunca sale por WiFi).
+
+## 5c. Accesorios: agujas, señales, desacopladores, descarriladores
+
+Primer soporte de conmutación de accesorios (`LAN_X_GET_TURNOUT_INFO` /
+`LAN_X_SET_TURNOUT` / `LAN_X_TURNOUT_INFO`, PDF sección 5 "Switching").
+
+- **Un único modelo para todo**: el protocolo Z21 no distingue tipos de
+  accesorio — una aguja, una señal de 2 aspectos (rojo/verde) o un
+  desacoplador/descarrilador biestable son, a nivel de LAN_X, el mismo
+  "decodificador de accesorios DCC de 2 salidas" (salida 1 / salida 2).
+  El firmware refleja esto con un único `AccessoryState` (dirección de
+  16 bits + posición conocida) y unos únicos métodos de la capa de
+  abstracción de tracción (`setTurnout()`, `requestTurnoutRefresh()`,
+  `getTurnoutState()`), reutilizados igual por el backend XpressNet que
+  por el dummy.
+- **Direccionamiento**: a diferencia de las locomotoras (14 bits útiles,
+  `Adr_MSB & 0x3F`), la dirección de accesorio usa los 16 bits completos
+  de `FAdr_MSB`/`FAdr_LSB` sin enmascarar (PDF sección 5.1). Por eso la
+  dirección `0` es válida para un accesorio (a diferencia de una loco), y
+  la tabla en RAM usa `0xFFFF` como marcador de slot libre.
+- **Formato de `LAN_X_SET_TURNOUT`**: `DB2 = 10Q0A00P` — `A` activa/
+  desactiva la salida seleccionada, `P` elige salida 1/2, `Q` (desde Z21
+  FW V1.24) pide encolar el comando en vez de ejecutarlo ya. `Q` se
+  ignora por ahora: no hay cola de accesorios implementada, todo se
+  ejecuta de inmediato (comportamiento `Q=0`, compatible con versiones
+  anteriores del protocolo).
+- **Backend XpressNet**: usa `XpressNet.setTrntPos()`/`getTrntInfo()` y
+  el callback `notifyTrnt()` de la librería `Digital-MoBa/XpressNet`. La
+  conversión de formato entre el `DB2` de Z21 y el `Pos` que espera la
+  librería está basada en el proyecto de referencia `tkoning/Z21-arduino`
+  (sección 13) pero **sin confirmar todavía contra hardware real** — ver
+  el detalle completo de la asunción en `traction_backend_xpressnet.h`
+  (punto 4 de "ASUNCIONES A VALIDAR").
+- **Pendiente (no v1 de accesorios)**: señales de más de 2 aspectos
+  necesitan `LAN_X_SET_EXT_ACCESSORY` (PDF sección 5.4, DCC "extended
+  accessory decoder package format") — comando distinto, con su propio
+  formato de datos; no reutiliza `AccessoryState` tal cual. Tampoco hay
+  todavía forma de que la app Z21 muestre nombres/tipos de accesorio (la
+  propia Z21 real tampoco lo hace por LAN — eso vive en el software de
+  control, p.ej. Rocrail/JMRI, no en el protocolo).
 
 ## 6. Conectividad WiFi (ESP8266)
 

@@ -38,6 +38,8 @@
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h> // ArduinoOTA lo usa para anunciarse como "puerto de red" en el IDE
+#include <ArduinoOTA.h>
 #include <EEPROM.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -202,7 +204,7 @@ bool evLogThrottle(unsigned long &lastMs, unsigned long minIntervalMs) {
 // seccion -- las demas (usuario/password del portal, MAC personalizada)
 // se quedan intactas. Cada seccion es responsable solo de sus propios
 // datos y de su propia validez (responsabilidad unica).
-#define EEPROM_SIZE 512
+#define EEPROM_SIZE 2048
 #define EEPROM_SECTION_VALID 0xC3 // "esta seccion tiene datos guardados con el layout actual"
 
 // --- Seccion: redes WiFi guardadas (hasta 3), ver "Conectividad" abajo ---
@@ -235,6 +237,36 @@ bool evLogThrottle(unsigned long &lastMs, unsigned long minIntervalMs) {
 #define DEFAULT_MAC_OUI_1 0x2B
 #define DEFAULT_MAC_OUI_2 0xBC
 
+// --- Seccion: password de OTA (actualizacion de firmware por WiFi) ---
+// Deliberadamente SEPARADA de cfgWebPass (la del portal): son privilegios
+// distintos -- ver/cambiar la configuracion no es lo mismo que poder
+// flashear codigo arbitrario en el ESP. Si la password del portal se
+// filtra, con una password de OTA distinta el atacante no gana tambien la
+// capacidad de reemplazar el firmware entero.
+#define EEPROM_ADDR_OTAPASS_VALID (EEPROM_ADDR_MAC + EEPROM_ADDR_MAC_LEN)
+#define EEPROM_ADDR_OTAPASS (EEPROM_ADDR_OTAPASS_VALID + 1)
+#define EEPROM_ADDR_OTAPASS_LEN 32
+
+// --- Seccion: nombres "amigables" de clientes Z21 (panel /clients) ---
+// Cada registro: 1 byte (keyIsMac) + 6 bytes (mac o ip, ver Z21Client mas
+// abajo) + nombre. MAX_TRACKED_CLIENTS y CLIENT_NAME_LEN se definen aqui
+// (no junto al resto de cosas de clientes, mas abajo) porque hacen falta
+// para calcular el tamaño de esta seccion de EEPROM.
+//
+// 16 es un numero arbitrario, no un limite de hardware/RAM: cada entrada
+// son ~44 bytes en RAM (trivial) y 32 en EEPROM, asi que subirlo mas
+// (32, 50...) seguiria siendo barato -- se puede subir sin miedo si hacen
+// falta mas. El cuello de botella real para muchos clientes activos a la
+// vez NO esta aqui, esta en el enlace serie unico hacia el Mega (un solo
+// canal, un solo microcontrolador procesando comandos uno detras de
+// otro) -- eso no lo arregla agrandar esta tabla, ver comentario junto a
+// CLIENT_REPLY_QUEUE_LEN mas abajo.
+#define MAX_TRACKED_CLIENTS 16
+#define CLIENT_NAME_LEN 24
+#define EEPROM_CLIENT_RECORD_LEN (1 + 6 + (CLIENT_NAME_LEN + 1)) // keyIsMac + key + nombre
+#define EEPROM_ADDR_CLIENTS_VALID (EEPROM_ADDR_OTAPASS + EEPROM_ADDR_OTAPASS_LEN)
+#define EEPROM_ADDR_CLIENTS (EEPROM_ADDR_CLIENTS_VALID + 1) // MAX_TRACKED_CLIENTS registros consecutivos desde aqui
+
 char cfgSSID[WIFI_MAX_NETWORKS][EEPROM_ADDR_SSID_LEN + 1] = {"", "", ""};
 char cfgPass[WIFI_MAX_NETWORKS][EEPROM_ADDR_PASS_LEN + 1] = {"", "", ""};
 // TODO: valores por defecto conocidos ("admin"/"z21admin") -- inseguro
@@ -244,6 +276,7 @@ char cfgWebUser[EEPROM_ADDR_WEBUSER_LEN + 1] = "admin";
 char cfgWebPass[EEPROM_ADDR_WEBPASS_LEN + 1] = "z21admin";
 bool cfgMacCustomEnabled = false;
 uint8_t cfgMacAddr[EEPROM_ADDR_MAC_LEN] = {0, 0, 0, 0, 0, 0};
+char cfgOtaPass[EEPROM_ADDR_OTAPASS_LEN + 1] = "z21firmware"; // TODO: mismo aviso que cfgWebPass -- cambiar en cuanto se use en serio
 
 // ---------------------------------------------------------------------
 // Estado de red
@@ -256,12 +289,15 @@ uint8_t cfgMacAddr[EEPROM_ADDR_MAC_LEN] = {0, 0, 0, 0, 0, 0};
 // TODO: fijo por ahora a proposito (no se toca el Mega, que esta con otros
 // procesos). Mas adelante: generar una password aleatoria por placa y
 // mostrarla en la pantalla del Mega, en vez de tenerla fija en el firmware.
-// OJO: WPA2 exige minimo 8 caracteres -- "z21" tiene 3, asi que
-// WiFi.softAP() lo va a rechazar y el AP saldra ABIERTO (sin cifrado) en
-// vez de con esta password. Se deja tal cual porque es lo pedido para
-// esta fase; hay que alargarla (o generarla) antes de considerar esto
-// definitivo.
-#define AP_FIXED_PASSWORD "z21"
+//
+// "z21" (3 caracteres) que se uso al principio NO llegaba al minimo de 8
+// que exige WPA2 -- WiFi.softAP() lo rechazaba en silencio y el AP salia
+// ABIERTO en la practica, sin ningun cifrado. Se alargo a "z21admin" (8
+// caracteres) reutilizando el mismo valor por defecto que ya existia para
+// la password del portal web (cfgWebPass) en vez de inventar un secreto
+// nuevo -- sigue siendo temporal/fijo tal como se pidio, pero ahora si
+// cifra la red de verdad.
+#define AP_FIXED_PASSWORD "z21admin"
 // Cada cuanto, estando en modo AP, se reintenta conectar a alguna de las
 // redes STA guardadas (por si vuelve a estar disponible). No se hace mas
 // a menudo para no cortar a los clientes ya conectados al AP demasiado
@@ -276,10 +312,201 @@ unsigned long apModeSinceMs = 0; // 0 = no estamos en AP; si no, marca de tiempo
 WiFiUDP z21Udp;
 ESP8266WebServer webServer(80);
 
-// Recuerda de qué IP/puerto vino el último datagrama UDP, para poder
-// reenviar hacia el cliente correcto la respuesta que llegue del Mega.
-IPAddress lastClientIP;
-uint16_t lastClientPort = 0;
+// Buffer temporal para el archivo subido en /restore (ver handleRestoreUpload()
+// / handleRestoreDone() mas abajo) -- un backup nuestro son unas pocas lineas
+// de JSON, asi que un limite de RESTORE_MAX_UPLOAD_BYTES generoso evita que un
+// archivo subido por error (o con mala intencion) llene la RAM del ESP.
+#define RESTORE_MAX_UPLOAD_BYTES 4096
+String restoreUploadBuffer;
+bool restoreUploadTooBig = false;
+
+// ---------------------------------------------------------------------
+// Soporte multi-cliente Z21
+// ---------------------------------------------------------------------
+// ANTES: una sola variable global lastClientIP/lastClientPort, que se
+// sobreescribia con cada UDP entrante. Con un solo cliente Z21 conectado
+// (el caso normal hasta ahora) funciona perfecto -- pero con dos o mas
+// apps conectadas a la vez, si llegan peticiones de A y de B casi
+// seguidas, la respuesta que venga del Mega para A puede acabar
+// mandandose a B (quien sea que haya escrito ultimo en la variable),
+// simplemente por el orden de llegada, no por a quien correspondia.
+//
+// ARREGLO (best-effort, sin tocar el Mega): en vez de "el ultimo", se
+// lleva una COLA FIFO de clientes pendientes de respuesta. Cada peticion
+// UDP reenviada al Mega empuja (IP, puerto) al final de la cola; cada
+// frame Z21 que vuelve del Mega hace pop del PRIMERO de la cola (asume
+// que el Mega procesa y responde en el mismo orden en que le llegan las
+// peticiones, que es like que su firmware sea de un solo hilo leyendo el
+// serie secuencialmente -- una mejora real sobre "el ultimo que hablo",
+// pero sigue siendo una heuristica).
+//
+// LIMITE REAL DE ESTE ENFOQUE: el framing ESP<->Mega no lleva ningun
+// identificador de cliente. Si el Mega alguna vez manda una respuesta sin
+// que le corresponda a la peticion que esta en la cabeza de la cola (por
+// ejemplo, un frame que en realidad es un broadcast a raiz de un cambio
+// de estado, no una respuesta directa a la ultima peticion), este frame
+// se enviaria igualmente al cliente equivocado. Una solucion robusta de
+// verdad necesitaria que el Mega etiquetase sus respuestas con un indice
+// de cliente en el framing -- eso SI implica tocar el Mega, y no se ha
+// hecho aqui a proposito (ver conversacion: "no tocar el Mega").
+//
+// Ademas: los mensajes de tipo BROADCAST del protocolo Z21 real (cambios
+// de estado de una loco, de la alimentacion de via, etc.) deberian
+// mandarse a TODOS los clientes conectados con el flag correspondiente
+// activado (ver LAN_SET_BROADCASTFLAGS en z21_protocol.h), no solo al que
+// esta en la cabeza de la cola -- eso tampoco esta implementado: hoy CADA
+// frame Z21 que vuelve del Mega se trata como respuesta directa a un solo
+// cliente. Con un solo cliente conectado (uso tipico hasta ahora) no se
+// nota; con varios apps a la vez, cada una podria dejar de ver los
+// cambios que provoquen las demas. Documentado como limitacion conocida.
+//
+// Este numero es sobre PETICIONES EN VUELO (mandadas al Mega, respuesta
+// aun no llegada), no sobre cuantos clientes puede haber en total -- eso
+// es MAX_TRACKED_CLIENTS, mas arriba, un contador distinto. En la
+// practica esta cola se vacia casi al instante (el Mega responde en el
+// mismo loop() o el siguiente), asi que ni con muchos clientes activos
+// deberia llenarse mientras el enlace serie vaya siguiendole el ritmo.
+// Subirlo es barato (unos pocos bytes por hueco) pero NO evita que el
+// enlace serie sea el cuello de botella real: sigue siendo un solo canal
+// y un solo microcontrolador (el Mega) procesando comandos uno detras de
+// otro, igual que en la central Z21 real -- mas clientes a la vez
+// escribiendo trenes significa mas comandos por segundo por ese mismo
+// canal, no una cola mas larga aqui.
+#define CLIENT_REPLY_QUEUE_LEN 16
+struct PendingReply {
+  IPAddress ip;
+  uint16_t port;
+};
+PendingReply replyQueue[CLIENT_REPLY_QUEUE_LEN];
+uint8_t replyQueueHead = 0;  // siguiente a sacar (pop)
+uint8_t replyQueueCount = 0;
+
+void replyQueuePush(IPAddress ip, uint16_t port) {
+  if (replyQueueCount >= CLIENT_REPLY_QUEUE_LEN) {
+    // Cola llena (demasiadas peticiones sin respuesta aun) -- se descarta
+    // la mas antigua para no bloquear indefinidamente; mejor perder una
+    // respuesta ocasional que dejar de aceptar peticiones nuevas.
+    replyQueueHead = (replyQueueHead + 1) % CLIENT_REPLY_QUEUE_LEN;
+    replyQueueCount--;
+    evLogfL(LOG_LVL_WARN, "[Z21] Cola de respuestas llena, se descarta la mas antigua");
+  }
+  uint8_t tail = (replyQueueHead + replyQueueCount) % CLIENT_REPLY_QUEUE_LEN;
+  replyQueue[tail].ip = ip;
+  replyQueue[tail].port = port;
+  replyQueueCount++;
+}
+
+// Devuelve true y rellena ip/port si habia algo en la cola; false si esta vacia.
+bool replyQueuePop(IPAddress &ip, uint16_t &port) {
+  if (replyQueueCount == 0) return false;
+  ip = replyQueue[replyQueueHead].ip;
+  port = replyQueue[replyQueueHead].port;
+  replyQueueHead = (replyQueueHead + 1) % CLIENT_REPLY_QUEUE_LEN;
+  replyQueueCount--;
+  return true;
+}
+
+// ---------------------------------------------------------------------
+// Registro de clientes (panel /clients): quien se ha conectado, con que
+// IP/MAC, y el nombre "amigable" que se le haya puesto.
+// ---------------------------------------------------------------------
+// LIMITACION DE LA MAC: solo se puede averiguar la MAC de un cliente
+// cuando el ESP esta en modo AP (nuestro propio AP conoce la MAC de cada
+// estacion conectada, via wifi_softap_get_station_info() del SDK). Si el
+// ESP esta en modo STA (conectado al router de casa, el caso normal), NO
+// hay forma sencilla de obtener la MAC de otro dispositivo en esa red
+// desde el ESP -- el Arduino core no expone la tabla ARP, y montar una
+// resolucion ARP manual seria fragil y no aportaria fiabilidad real. En
+// ese caso se seguiria por IP como identidad (keyIsMac=false); si la IP
+// de ese cliente cambia (DHCP), el ESP lo vera como un cliente nuevo, sin
+// poder enlazarlo con el nombre puesto antes. Es una limitacion de
+// plataforma, no una decision de diseño.
+#define CLIENT_TIMEOUT_MS 30000UL // sin paquetes de este cliente en 30s -> se marca desconectado
+
+struct Z21Client {
+  bool inUse;
+  bool keyIsMac;       // true: identidad = mac[6]; false: identidad = ip (ver limitacion arriba)
+  uint8_t mac[6];
+  IPAddress ip;         // IP actual (o la unica conocida, si keyIsMac=false)
+  uint16_t lastPort;
+  unsigned long lastSeenMs; // 0 = no visto en este arranque (solo puede pasar en entradas cargadas de EEPROM)
+  bool hasName;
+  char name[CLIENT_NAME_LEN + 1];
+};
+Z21Client z21Clients[MAX_TRACKED_CLIENTS];
+
+// Intenta resolver la MAC de un cliente a partir de su IP. Solo funciona
+// si el ESP esta en modo AP (nuestro propio AP conoce la MAC de cada
+// estacion conectada a el, via el SDK) -- ver el comentario grande mas
+// arriba sobre por que en modo STA esto no es posible con las APIs
+// estandar del core.
+bool resolveStationMac(IPAddress ip, uint8_t *macOut) {
+  if (!isAPMode) return false;
+
+  struct station_info *station = wifi_softap_get_station_info();
+  bool found = false;
+  while (station != NULL) {
+    IPAddress stationIp(station->ip.addr);
+    if (stationIp == ip) {
+      memcpy(macOut, station->bssid, 6);
+      found = true;
+      break;
+    }
+    station = STAILQ_NEXT(station, next);
+  }
+  wifi_softap_free_station_info();
+  return found;
+}
+
+// Se llama con cada datagrama UDP Z21 entrante (ver handleZ21Udp()).
+// Busca si ya conocemos a este cliente (por MAC si se puede resolver,
+// si no por IP) y actualiza su "visto por ultima vez"; si es nuevo, le
+// asigna un hueco libre, o desaloja al anonimo visto hace mas tiempo si
+// la tabla esta llena -- los clientes CON NOMBRE puesto nunca se
+// desalojan, para que el panel /clients los pueda seguir mostrando como
+// "Desconectado" en vez de perderlos.
+void trackClient(IPAddress ip, uint16_t port) {
+  uint8_t mac[6];
+  bool macKnown = resolveStationMac(ip, mac);
+
+  int slot = -1;
+  for (uint8_t i = 0; i < MAX_TRACKED_CLIENTS; i++) {
+    if (!z21Clients[i].inUse) continue;
+    bool sameByMac = macKnown && z21Clients[i].keyIsMac && memcmp(z21Clients[i].mac, mac, 6) == 0;
+    bool sameByIpUpgrade = macKnown && !z21Clients[i].keyIsMac && z21Clients[i].ip == ip;
+    bool sameByIp = !macKnown && !z21Clients[i].keyIsMac && z21Clients[i].ip == ip;
+    if (sameByMac || sameByIpUpgrade || sameByIp) {
+      slot = i;
+      break;
+    }
+  }
+
+  if (slot < 0) {
+    for (uint8_t i = 0; i < MAX_TRACKED_CLIENTS; i++) {
+      if (!z21Clients[i].inUse) { slot = i; break; }
+    }
+  }
+  if (slot < 0) {
+    unsigned long oldest = 0xFFFFFFFFUL;
+    for (uint8_t i = 0; i < MAX_TRACKED_CLIENTS; i++) {
+      if (z21Clients[i].hasName) continue; // nunca se desaloja a uno con nombre
+      if (z21Clients[i].lastSeenMs < oldest) {
+        oldest = z21Clients[i].lastSeenMs;
+        slot = i;
+      }
+    }
+  }
+  if (slot < 0) return; // tabla llena de clientes con nombre, no hay hueco -- se ignora este cliente nuevo
+
+  z21Clients[slot].inUse = true;
+  z21Clients[slot].ip = ip;
+  z21Clients[slot].lastPort = port;
+  z21Clients[slot].lastSeenMs = millis();
+  if (macKnown) {
+    z21Clients[slot].keyIsMac = true;
+    memcpy(z21Clients[slot].mac, mac, 6);
+  }
+}
 
 // ---------------------------------------------------------------------
 // EEPROM helpers
@@ -328,9 +555,79 @@ void loadConfig() {
   if (cfgMacCustomEnabled) {
     readEEPROMBytes(EEPROM_ADDR_MAC, cfgMacAddr, EEPROM_ADDR_MAC_LEN);
   }
+
+  if (EEPROM.read(EEPROM_ADDR_OTAPASS_VALID) == EEPROM_SECTION_VALID) {
+    readEEPROMString(EEPROM_ADDR_OTAPASS, cfgOtaPass, EEPROM_ADDR_OTAPASS_LEN);
+  }
+  // si no, se queda "z21firmware" por defecto
+
+  loadClientNames();
 }
 
-// Guarda SIEMPRE las 3 secciones juntas -- de momento el formulario del
+// Carga los nombres de clientes guardados directamente en z21Clients[],
+// uno por indice -- separado de loadConfig()/saveConfig() porque poner o
+// cambiar un nombre NO debe reiniciar el ESP (a diferencia de guardar la
+// config de red/portal/OTA, que si lo hace). lastSeenMs se deja a 0
+// (nunca visto en este arranque) hasta que el cliente vuelva a mandar
+// algo -- por eso un cliente con nombre aparece "Desconectado" hasta que
+// se le vea de nuevo, en vez de asumir que sigue conectado tras un reinicio.
+void loadClientNames() {
+  if (EEPROM.read(EEPROM_ADDR_CLIENTS_VALID) != EEPROM_SECTION_VALID) return; // nada guardado
+
+  for (uint8_t i = 0; i < MAX_TRACKED_CLIENTS; i++) {
+    int base = EEPROM_ADDR_CLIENTS + i * EEPROM_CLIENT_RECORD_LEN;
+    uint8_t keyIsMacByte = EEPROM.read(base);
+    uint8_t key[6];
+    readEEPROMBytes(base + 1, key, 6);
+    char name[CLIENT_NAME_LEN + 1];
+    readEEPROMString(base + 1 + 6, name, CLIENT_NAME_LEN);
+    if (strlen(name) == 0) continue; // registro vacio -> ese slot se queda libre en RAM
+
+    z21Clients[i].inUse = true;
+    z21Clients[i].hasName = true;
+    z21Clients[i].keyIsMac = (keyIsMacByte == 1);
+    if (z21Clients[i].keyIsMac) {
+      memcpy(z21Clients[i].mac, key, 6);
+    } else {
+      z21Clients[i].ip = IPAddress(key[0], key[1], key[2], key[3]);
+    }
+    z21Clients[i].lastPort = 0;
+    z21Clients[i].lastSeenMs = 0;
+    strncpy(z21Clients[i].name, name, CLIENT_NAME_LEN);
+    z21Clients[i].name[CLIENT_NAME_LEN] = '\0';
+  }
+}
+
+// Contraparte de loadClientNames(): vuelca z21Clients[] a EEPROM tal cual
+// esta en RAM (slots sin nombre se guardan vacios). Se llama directamente
+// desde los handlers de /clients -- sin EEPROM.commit() de mas ni
+// ESP.restart(), a diferencia de saveConfig().
+void saveClientNamesToEeprom() {
+  EEPROM.write(EEPROM_ADDR_CLIENTS_VALID, EEPROM_SECTION_VALID);
+  for (uint8_t i = 0; i < MAX_TRACKED_CLIENTS; i++) {
+    int base = EEPROM_ADDR_CLIENTS + i * EEPROM_CLIENT_RECORD_LEN;
+    if (z21Clients[i].inUse && z21Clients[i].hasName) {
+      EEPROM.write(base, z21Clients[i].keyIsMac ? 1 : 0);
+      uint8_t key[6] = {0, 0, 0, 0, 0, 0};
+      if (z21Clients[i].keyIsMac) {
+        memcpy(key, z21Clients[i].mac, 6);
+      } else {
+        IPAddress ip = z21Clients[i].ip;
+        key[0] = ip[0]; key[1] = ip[1]; key[2] = ip[2]; key[3] = ip[3];
+      }
+      writeEEPROMBytes(base + 1, key, 6);
+      writeEEPROMString(base + 1 + 6, z21Clients[i].name, CLIENT_NAME_LEN);
+    } else {
+      EEPROM.write(base, 0);
+      uint8_t zero[6] = {0, 0, 0, 0, 0, 0};
+      writeEEPROMBytes(base + 1, zero, 6);
+      writeEEPROMString(base + 1 + 6, "", CLIENT_NAME_LEN);
+    }
+  }
+  EEPROM.commit();
+}
+
+// Guarda SIEMPRE las 4 secciones juntas -- de momento el formulario del
 // portal las manda todas en un solo POST a /save. Si el dia de mañana se
 // separan en formularios/handlers distintos, cada seccion ya tiene su
 // propio byte de validez y se podria guardar de forma independiente sin
@@ -349,6 +646,9 @@ void saveConfig() {
 
   EEPROM.write(EEPROM_ADDR_MAC_VALID, cfgMacCustomEnabled ? EEPROM_SECTION_VALID : 0);
   writeEEPROMBytes(EEPROM_ADDR_MAC, cfgMacAddr, EEPROM_ADDR_MAC_LEN);
+
+  EEPROM.write(EEPROM_ADDR_OTAPASS_VALID, EEPROM_SECTION_VALID);
+  writeEEPROMString(EEPROM_ADDR_OTAPASS, cfgOtaPass, EEPROM_ADDR_OTAPASS_LEN);
 
   EEPROM.commit();
 }
@@ -465,7 +765,14 @@ void startAPFallback() {
   WiFi.mode(WIFI_AP);
   applyMac();
   WiFi.softAPConfig(AP_FIXED_IP, AP_GATEWAY, AP_SUBNET);
-  WiFi.softAP(apSSID.c_str(), AP_FIXED_PASSWORD);
+  // max_connection=8: este SI es un limite real (no arbitrario nuestro) --
+  // es el maximo de estaciones WiFi que el chip ESP8266 puede tener
+  // asociadas a la vez en modo AP, a nivel de SDK/hardware. El valor por
+  // defecto del core si no se especifica es 4; lo subimos al maximo real.
+  // Solo importa si el ESP esta haciendo de AP (fallback, sin router) --
+  // en modo STA (conectado a tu router de casa, el caso normal) este
+  // limite no aplica en absoluto: lo gestiona tu router, no el ESP.
+  WiFi.softAP(apSSID.c_str(), AP_FIXED_PASSWORD, 1, 0, 8);
   IPAddress ip = WiFi.softAPIP();
   evLogf("[WiFi] Modo AP SSID=%s IP=%d.%d.%d.%d MAC=%s", apSSID.c_str(), ip[0], ip[1], ip[2], ip[3], WiFi.softAPmacAddress().c_str());
 }
@@ -1006,8 +1313,7 @@ void handleZ21Udp() {
     udpPacketsSeen++;
     lastUdpSourceIP = z21Udp.remoteIP();
     lastUdpSourcePort = z21Udp.remotePort();
-    lastClientIP = z21Udp.remoteIP();
-    lastClientPort = z21Udp.remotePort();
+    trackClient(lastUdpSourceIP, lastUdpSourcePort);
     int len = z21Udp.read(udpBuf, UDP_BUF_SIZE);
 
     char hexPreview[3 * 16 + 1] = "";
@@ -1022,6 +1328,7 @@ void handleZ21Udp() {
            lastUdpSourcePort, len, hexPreview, (len > 16) ? "..." : "");
 
     sendToMega(FRAME_TYPE_Z21, udpBuf, (uint8_t)len);
+    replyQueuePush(lastUdpSourceIP, lastUdpSourcePort);
 
     // TODO (fase 2): si el sniffer está activo, también volcar este frame
     // por WebSocket antes/después de reenviarlo al Mega.
@@ -1038,10 +1345,20 @@ void handleZ21Udp() {
       // El Mega se reinició y vuelve a pedir sincronización (p.ej. reset
       // del watchdog): contestamos igual, sin volver a bloquear el UDP.
       buildAndSendNetInfo();
-    } else if (megaType == FRAME_TYPE_Z21 && lastClientPort != 0) {
-      z21Udp.beginPacket(lastClientIP, lastClientPort);
-      z21Udp.write(megaBuf, megaLen);
-      z21Udp.endPacket();
+    } else if (megaType == FRAME_TYPE_Z21) {
+      IPAddress replyIp;
+      uint16_t replyPort;
+      if (replyQueuePop(replyIp, replyPort)) {
+        z21Udp.beginPacket(replyIp, replyPort);
+        z21Udp.write(megaBuf, megaLen);
+        z21Udp.endPacket();
+      } else {
+        // No hay ningun cliente pendiente en la cola -- puede pasar si el
+        // Mega manda un frame Z21 que no es respuesta directa a nada (ver
+        // limitacion de broadcasts documentada junto a la cola FIFO mas
+        // arriba). Se descarta en vez de mandarlo a cualquiera.
+        evLogfL(LOG_LVL_WARN, "[Z21] Frame del Mega sin cliente pendiente en la cola -- descartado");
+      }
 
       // TODO (fase 2): volcar también esta respuesta por WebSocket si el
       // sniffer está activo.
@@ -1069,7 +1386,7 @@ bool checkWebAuth() {
 // configuracion porque nadie lo actualizo a la vez en los 4 sitios.
 // ---------------------------------------------------------------------
 const char PAGE_NAV[] PROGMEM =
-  "<nav><a href='/'>Estado</a> | <a href='/sniffer'>Sniffer</a> | "
+  "<nav><a href='/'>Estado</a> | <a href='/clients'>Clientes</a> | <a href='/sniffer'>Sniffer</a> | "
   "<a href='/log'>Log</a> | <a href='/test'>Prueba de enlace</a> | "
   "<a href='/#config'>Config</a></nav>";
 
@@ -1078,9 +1395,10 @@ String pageNav() {
 }
 
 // Apertura comun de pagina: <head> con la hoja de estilos compartida
-// (/style.css, servida desde PROGMEM en gzip, ver web_assets.h) mas el
-// <title> y el <h1>, y ya deja la barra de nav puesta. Cada handler solo
-// tiene que anadir su contenido propio y cerrar </body></html>.
+// (/style.css, servida desde PROGMEM en gzip, ver web_assets.h), cabecera
+// con el <h1>, la barra de nav, y abre el contenedor .wrap (centrado, con
+// margen) donde va el contenido propio de cada pagina. Cada handler debe
+// cerrar ese .wrap ademas de </body></html> -- ver pageFoot().
 // extraHead es para markup adicional dentro de <head> que no todas las
 // paginas necesitan (p.ej. el meta refresh de /log y /sniffer) -- se deja
 // vacio por defecto.
@@ -1089,9 +1407,16 @@ String pageHead(const char *title, const char *h1, const char *extraHead = "") {
   html += extraHead;
   html += "<link rel='stylesheet' href='/style.css'>";
   html += "<title>" + String(title) + "</title></head><body>";
-  html += "<h1>" + String(h1) + "</h1>";
+  html += "<header><h1>" + String(h1) + "</h1></header>";
   html += pageNav();
+  html += "<div class='wrap'>";
   return html;
+}
+
+// Cierre comun de pagina: complementa a pageHead(), cierra el .wrap que
+// esta abrio.
+String pageFoot() {
+  return "</div></body></html>";
 }
 
 void handleStyleCss() {
@@ -1104,15 +1429,292 @@ void handleStyleCss() {
   webServer.send_P(200, "text/css", (const char *)STYLE_CSS_GZIP, STYLE_CSS_GZIP_LEN);
 }
 
+void handleAppJs() {
+  // Mismo razonamiento que handleStyleCss(): estatico, sin datos
+  // sensibles, no requiere autenticacion.
+  webServer.sendHeader("Content-Encoding", "gzip");
+  webServer.sendHeader("Cache-Control", "public, max-age=86400");
+  webServer.send_P(200, "application/javascript", (const char *)APP_JS_GZIP, APP_JS_GZIP_LEN);
+}
+
+// Escapa un String para poder meterlo dentro de HTML, tanto en contenido
+// de texto (<p>...</p>) como dentro de un atributo entre comillas simples
+// (value='...') -- por eso escapa tambien la comilla simple, no solo & < >.
+//
+// Por que hace falta esto: varios valores que se reinsertan en las
+// paginas del portal NO los escribe el dueño del ESP a mano -- el SSID
+// que aparece en "Red conectada" o el que se guarda al pulsar "Red 1/2/3"
+// en el buscador (ver /scan) es el nombre que OTRO ROUTER (de un vecino,
+// por ejemplo) decidio ponerse. Sin escapar, un SSID con una comilla
+// rompe el atributo value='...' del formulario, y uno con <script> se
+// ejecutaria sin mas al abrir tu propio /log o / -- self-XSS, pero real.
+String htmlEscape(const String &in) {
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
+// Escapa un String para poder meterlo como valor string dentro de JSON
+// (comillas y backslash escapados, caracteres de control fuera). Los SSID
+// normalmente no llevan nada raro, pero nada impide que alguien ponga
+// comillas en el suyo -- sin esto, ese SSID rompería el JSON generado.
+String jsonEscape(const String &in) {
+  String out;
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if ((uint8_t)c >= 0x20) {
+      out += c; // los caracteres de control (<0x20) se descartan directamente
+    }
+  }
+  return out;
+}
+
+// Escanea las redes WiFi visibles y las devuelve en JSON, para que el
+// formulario de configuracion las ofrezca en una lista en vez de tener
+// que escribir el SSID a mano (ver scanNetworks() en app.js / web_assets.h).
+void handleScan() {
+  if (!checkWebAuth()) return;
+
+  // WiFi.scanNetworks() necesita la interfaz STA activa. Si estamos en
+  // modo AP (fallback), se activa STA tambien solo para el escaneo y se
+  // vuelve al modo original al terminar -- así no se deja un STA a medias
+  // colgado ni se interrumpe el AP para los clientes ya conectados a el.
+  WiFiMode_t prevMode = WiFi.getMode();
+  if (prevMode == WIFI_AP) {
+    WiFi.mode(WIFI_AP_STA);
+  }
+
+  int n = WiFi.scanNetworks();
+  evLogf("[WiFi] Escaneo manual desde el portal: %d redes visibles", n);
+
+  String json = "[";
+  for (int i = 0; i < n; i++) {
+    if (i > 0) json += ",";
+    json += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    json += "\"enc\":" + String(WiFi.encryptionType(i) == ENC_TYPE_NONE ? 0 : 1) + "}";
+  }
+  json += "]";
+  WiFi.scanDelete(); // libera la memoria de los resultados del escaneo
+
+  if (prevMode == WIFI_AP) {
+    WiFi.mode(WIFI_AP); // volver al modo original, no dejar STA activo sin usarlo
+  }
+
+  webServer.send(200, "application/json", json);
+}
+
+// ---------------------------------------------------------------------
+// Backup / Restore de la configuracion (redes WiFi, credenciales del
+// portal, MAC personalizada) -- ver /backup y /restore mas abajo.
+//
+// El JSON se genera y se lee a mano (sin libreria tipo ArduinoJson) por
+// el mismo motivo que /scan: es un formato PLANO y controlado enteramente
+// por nosotros (lo generamos y lo consumimos los dos), asi que no hace
+// falta un parser JSON general -- basta con buscar cada "clave":"valor"
+// literal. Si el dia de manana el formato se complica (anidado, arrays
+// variables) esto dejaria de ser suficiente y tocaria plantearse una
+// libreria de verdad.
+// ---------------------------------------------------------------------
+
+// Busca "key":"valor" en json y copia valor (sin comillas, con \" y \\
+// des-escapados) en outBuf. Devuelve false si la clave no aparece.
+bool jsonGetString(const String &json, const char *key, char *outBuf, size_t outBufLen) {
+  String pattern = "\"" + String(key) + "\":\"";
+  int start = json.indexOf(pattern);
+  if (start < 0) return false;
+  start += pattern.length();
+
+  size_t outIdx = 0;
+  for (int i = start; i < (int)json.length() && outIdx < outBufLen - 1; i++) {
+    char c = json[i];
+    if (c == '"') break; // fin del valor
+    if (c == '\\' && i + 1 < (int)json.length()) {
+      i++;
+      c = json[i]; // \" -> ", \\ -> \ (no hay otros escapes en lo que generamos nosotros)
+    }
+    outBuf[outIdx++] = c;
+  }
+  outBuf[outIdx] = '\0';
+  return true;
+}
+
+// Busca "key":true o "key":false. Si la clave no aparece, devuelve defaultVal.
+bool jsonGetBool(const String &json, const char *key, bool defaultVal) {
+  String pattern = "\"" + String(key) + "\":";
+  int start = json.indexOf(pattern);
+  if (start < 0) return defaultVal;
+  start += pattern.length();
+  return json.startsWith("true", start);
+}
+
+// Aplica un backup ya leido en memoria a las variables de config en RAM
+// (cfgSSID/cfgPass/cfgWebUser/cfgWebPass/cfgMacAddr). NO llama a
+// saveConfig() -- eso lo decide quien la llama, para poder validar antes
+// de comprometerse a escribir en EEPROM y reiniciar.
+//
+// Campos ausentes en el JSON se dejan tal cual estaban (igual que en
+// handleSave(): un campo que no llega no borra lo que ya habia). Solo
+// hace falta que aparezca al menos un SSID para considerar el backup
+// valido -- si no, lo mas probable es que sea un archivo equivocado.
+bool applyBackupJson(const String &json) {
+  if (json.indexOf("\"formatVersion\":1") < 0) {
+    evLogfL(LOG_LVL_ERROR, "[CFG] Restore: falta o no coincide \"formatVersion\":1 -- se ignora");
+    return false;
+  }
+
+  bool anyNetworkFound = false;
+  char tmpSsid[EEPROM_ADDR_SSID_LEN + 1];
+  char tmpPass[EEPROM_ADDR_PASS_LEN + 1];
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    String ssidKey = "ssid" + String(i + 1);
+    String passKey = "pass" + String(i + 1);
+    if (jsonGetString(json, ssidKey.c_str(), tmpSsid, sizeof(tmpSsid))) {
+      memcpy(cfgSSID[i], tmpSsid, sizeof(tmpSsid));
+      if (strlen(tmpSsid) > 0) anyNetworkFound = true;
+    }
+    if (jsonGetString(json, passKey.c_str(), tmpPass, sizeof(tmpPass))) {
+      memcpy(cfgPass[i], tmpPass, sizeof(tmpPass));
+    }
+  }
+
+  char tmpUser[EEPROM_ADDR_WEBUSER_LEN + 1];
+  char tmpWebPass[EEPROM_ADDR_WEBPASS_LEN + 1];
+  if (jsonGetString(json, "webUser", tmpUser, sizeof(tmpUser)) && strlen(tmpUser) > 0) {
+    memcpy(cfgWebUser, tmpUser, sizeof(tmpUser));
+  }
+  if (jsonGetString(json, "webPass", tmpWebPass, sizeof(tmpWebPass)) && strlen(tmpWebPass) > 0) {
+    memcpy(cfgWebPass, tmpWebPass, sizeof(tmpWebPass));
+  }
+
+  char tmpOtaPass[EEPROM_ADDR_OTAPASS_LEN + 1];
+  if (jsonGetString(json, "otaPass", tmpOtaPass, sizeof(tmpOtaPass)) && strlen(tmpOtaPass) > 0) {
+    memcpy(cfgOtaPass, tmpOtaPass, sizeof(tmpOtaPass));
+  }
+
+  if (jsonGetBool(json, "macCustomEnabled", false)) {
+    char tmpMac[18];
+    uint8_t parsedMac[6];
+    if (jsonGetString(json, "mac", tmpMac, sizeof(tmpMac)) &&
+        parseMacString(String(tmpMac), parsedMac) && isMacUnicastValid(parsedMac)) {
+      memcpy(cfgMacAddr, parsedMac, EEPROM_ADDR_MAC_LEN);
+      cfgMacCustomEnabled = true;
+    } else {
+      evLogfL(LOG_LVL_WARN, "[CFG] Restore: MAC del backup invalida -- se ignora ese campo, se mantiene la MAC actual");
+    }
+  } else {
+    cfgMacCustomEnabled = false;
+  }
+
+  if (!anyNetworkFound) {
+    evLogfL(LOG_LVL_ERROR, "[CFG] Restore: el JSON no trae ningun SSID -- probablemente no es un backup valido, se ignora entero");
+  }
+  return anyNetworkFound;
+}
+
+void handleBackup() {
+  if (!checkWebAuth()) return;
+
+  String json = "{";
+  json += "\"formatVersion\":1,";
+  json += "\"espFwVersion\":\"" + String(ESP_FW_VERSION_MAJOR) + "." + String(ESP_FW_VERSION_MINOR) + "\",";
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    json += "\"ssid" + String(i + 1) + "\":\"" + jsonEscape(String(cfgSSID[i])) + "\",";
+    json += "\"pass" + String(i + 1) + "\":\"" + jsonEscape(String(cfgPass[i])) + "\",";
+  }
+  json += "\"webUser\":\"" + jsonEscape(String(cfgWebUser)) + "\",";
+  json += "\"webPass\":\"" + jsonEscape(String(cfgWebPass)) + "\",";
+  json += "\"otaPass\":\"" + jsonEscape(String(cfgOtaPass)) + "\",";
+  json += "\"macCustomEnabled\":" + String(cfgMacCustomEnabled ? "true" : "false") + ",";
+  json += "\"mac\":\"" + (cfgMacCustomEnabled ? macToString(cfgMacAddr) : String("")) + "\"";
+  json += "}";
+
+  // El archivo lleva las passwords en claro (WiFi y del propio portal) --
+  // es la unica forma de que un restore deje todo listo sin tener que
+  // volver a teclearlas. Content-Disposition fuerza la descarga en vez de
+  // mostrarlo en el navegador, pero el fichero en si no va cifrado:
+  // tratarlo como se trataria cualquier fichero con passwords.
+  webServer.sendHeader("Content-Disposition", "attachment; filename=\"z21_emulator_backup.json\"");
+  webServer.send(200, "application/json", json);
+  evLogf("[CFG] Backup descargado desde el portal");
+}
+
+// Handler de SUBIDA (se llama varias veces mientras llega el archivo, ver
+// HTTPUpload). Solo acumula bytes en restoreUploadBuffer; el JSON se
+// interpreta y se aplica despues, en handleRestoreDone(), una vez que ha
+// llegado entero.
+void handleRestoreUpload() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    restoreUploadBuffer = "";
+    restoreUploadTooBig = false;
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (restoreUploadBuffer.length() + upload.currentSize > RESTORE_MAX_UPLOAD_BYTES) {
+      restoreUploadTooBig = true; // se sigue leyendo el resto para no romper el POST, pero se descarta
+    } else {
+      for (size_t i = 0; i < upload.currentSize; i++) {
+        restoreUploadBuffer += (char)upload.buf[i];
+      }
+    }
+  }
+  // UPLOAD_FILE_END: nada que hacer aqui, se procesa todo en handleRestoreDone()
+}
+
+// Handler de FIN de peticion POST /restore (se llama una vez, despues de
+// que handleRestoreUpload() ya haya recibido el archivo entero).
+void handleRestoreDone() {
+  if (!checkWebAuth()) return;
+
+  if (restoreUploadTooBig) {
+    evLogfL(LOG_LVL_ERROR, "[CFG] Restore: archivo demasiado grande (>%d bytes) -- se ignora", RESTORE_MAX_UPLOAD_BYTES);
+    webServer.send(400, "text/html", "<html><body>Archivo demasiado grande para ser un backup valido. <a href='/#config'>Volver</a></body></html>");
+    restoreUploadBuffer = "";
+    return;
+  }
+  if (restoreUploadBuffer.length() == 0) {
+    webServer.send(400, "text/html", "<html><body>No se ha recibido ningun archivo. <a href='/#config'>Volver</a></body></html>");
+    return;
+  }
+
+  bool ok = applyBackupJson(restoreUploadBuffer);
+  restoreUploadBuffer = ""; // liberar la RAM cuanto antes, ya no hace falta
+
+  if (!ok) {
+    webServer.send(400, "text/html", "<html><body>El archivo no tiene el formato de backup esperado (ver log del ESP para el detalle). <a href='/#config'>Volver</a></body></html>");
+    return;
+  }
+
+  saveConfig();
+  evLogf("[CFG] Configuracion restaurada desde backup, reiniciando...");
+  webServer.send(200, "text/html", "<html><body>Restaurado. Reiniciando...</body></html>");
+  delay(500);
+  ESP.restart();
+}
+
 void handleRoot() {
   if (!checkWebAuth()) return;
 
   String html = pageHead("Z21 Emulator Debug", "Z21 Emulator - Debug");
+  html += "<div class='card'>";
   html += "<h2>Estado general</h2>";
   html += "<p>Firmware ESP: v" + String(ESP_FW_VERSION_MAJOR) + "." + String(ESP_FW_VERSION_MINOR) + "</p>";
   html += "<p>Modo actual: " + String(isAPMode ? "AP (fallback)" : "STA (conectado)") + "</p>";
   if (!isAPMode) {
-    html += "<p>Red conectada: " + WiFi.SSID() + "</p>";
+    html += "<p>Red conectada: " + htmlEscape(WiFi.SSID()) + "</p>";
   }
   html += "<p>IP: " + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "</p>";
   html += "<p>RSSI: " + String(isAPMode ? 0 : WiFi.RSSI()) + " dBm</p>";
@@ -1120,7 +1722,10 @@ void handleRoot() {
   html += (isAPMode ? WiFi.softAPmacAddress() : WiFi.macAddress());
   html += cfgMacCustomEnabled ? " (personalizada)" : " (por defecto, prefijo 84:2B:BC)";
   html += "</p>";
+  html += "<p>OTA (actualizacion por WiFi): activo, hostname '" + htmlEscape(otaHostname) + "' (deberia aparecer como puerto de red en el IDE de Arduino; password propia, ver Configuraci&oacute;n)</p>";
+  html += "</div>";
 
+  html += "<div class='card'>";
   html += "<h2>Socket UDP Z21 (puerto " + String(Z21_UDP_PORT) + ")</h2>";
   html += "<p>Paquetes UDP vistos en total: " + String(udpPacketsSeen) + "</p>";
   if (udpPacketsSeen > 0) {
@@ -1128,7 +1733,9 @@ void handleRoot() {
   } else {
     html += "<p class='err'>Ningun paquete UDP ha llegado nunca a este socket. Revisa que el cliente este en la misma red y apuntando a esta IP y puerto.</p>";
   }
+  html += "</div>";
 
+  html += "<div class='card'>";
   html += "<h2>Estado del Mega</h2>";
   html += "<p>Sincronizacion inicial: " + String(megaSynced ? "completada" : "en curso (esperando HELLO/SYNC_ACK)") + "</p>";
   if (isMegaOnline()) {
@@ -1146,7 +1753,9 @@ void handleRoot() {
   } else {
     html += "<p class='err'><b>SIN RESPUESTA</b> (ultimo heartbeat hace " + String(millis() - lastHeartbeatReceivedMs) + " ms)</p>";
   }
+  html += "</div>";
 
+  html += "<div class='card'>";
   html += "<h2>Enlace Serial Mega↔ESP</h2>";
   html += "<p>Bytes crudos totales desde el arranque: " + String(totalRawBytesFromMega) + "</p>";
   html += "<p>Frames descartados por checksum: " + String(framesRxChkFailFromMega) + "</p>";
@@ -1157,13 +1766,18 @@ void handleRoot() {
     lastFrameHex += String(lastMegaFramePayload[i], HEX);
   }
   html += "<p>Último frame del Mega: tipo=0x" + String(lastMegaFrameType, HEX) + ", len=" + String(lastMegaFrameLen) + ", payload=" + lastFrameHex + "</p>";
+  html += "</div>";
 
   // TODO: campo para la direccion de cliente XpressNet (pendiente de definir)
+  html += "<div class='card'>";
   html += "<h2 id='config'>Configuración</h2>";
   html += "<form method='POST' action='/save'>";
   html += "<p>Hasta 3 redes WiFi, se prueban en este orden antes de caer al modo AP. Deja una fila con SSID vacio para no usar ese hueco.</p>";
+  html += "<p><button type='button' onclick='scanNetworks()'>Buscar redes WiFi</button> ";
+  html += "<i>(tarda unos segundos; pulsa \"Red 1/2/3\" junto a la que quieras para rellenar ese hueco)</i></p>";
+  html += "<div id='scanResults'></div>";
   for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
-    html += "Red " + String(i + 1) + " - SSID: <input name='ssid" + String(i + 1) + "' value='" + String(cfgSSID[i]) + "'> ";
+    html += "Red " + String(i + 1) + " - SSID: <input id='ssid" + String(i + 1) + "' name='ssid" + String(i + 1) + "' value='" + htmlEscape(String(cfgSSID[i])) + "'> ";
     html += "Password: <input name='pass" + String(i + 1) + "' type='password'> ";
     html += "<i>(dejar en blanco para no cambiarla)</i><br>";
   }
@@ -1184,7 +1798,7 @@ void handleRoot() {
   generateDefaultMac(defMac);
   char defTail[9];
   snprintf(defTail, sizeof(defTail), "%02X:%02X:%02X", defMac[3], defMac[4], defMac[5]);
-  html += String(defTail) + "): <input name='mac' value='" + macFieldValue + "' placeholder='AA:BB:CC:DD:EE:FF'><br>";
+  html += String(defTail) + "): <input name='mac' value='" + htmlEscape(macFieldValue) + "' placeholder='AA:BB:CC:DD:EE:FF'><br>";
   html += "<a href='/?genmac=1'>Generar MAC aleatoria (84:2B:BC:xx:xx:xx)</a> (revisa el campo y pulsa Guardar para aplicarla; evita colisiones con otros equipos de la red. Si quieres otro prefijo, escribelo tu directamente en el campo)<br>";
 
   // Usuario/password de ACCESO a este portal (checkWebAuth()). Antes no
@@ -1194,14 +1808,39 @@ void handleRoot() {
   // fuera del portal por una errata al escribirla -- si no coinciden, se
   // ignora el cambio y se mantiene la anterior (ver handleSave()).
   html += "<h3>Acceso al portal</h3>";
-  html += "<p>Usuario: <input name='webuser' value='" + String(cfgWebUser) + "'></p>";
+  html += "<p>Usuario: <input name='webuser' value='" + htmlEscape(String(cfgWebUser)) + "'></p>";
   html += "<p>Password nueva: <input name='webpass' type='password'> ";
   html += "Repetir: <input name='webpass2' type='password'> ";
   html += "<i>(dejar ambas en blanco para no cambiarla)</i></p>";
 
+  // Password de OTA (flashear firmware por WiFi), SEPARADA de la del
+  // portal a proposito -- ver comentario en setupOTA(). Mismo patron de
+  // 2 campos que la password del portal, por el mismo motivo.
+  html += "<h3>Actualizaci&oacute;n OTA</h3>";
+  html += "<p>Password nueva: <input name='otapass' type='password'> ";
+  html += "Repetir: <input name='otapass2' type='password'> ";
+  html += "<i>(dejar ambas en blanco para no cambiarla; es la que pide el IDE de Arduino al flashear por WiFi)</i></p>";
+
   html += "<input type='submit' value='Guardar y reiniciar'>";
   html += "</form>";
-  html += "</body></html>";
+  html += "</div>";
+
+  // Backup/restore en su propio <form> (no puede ir anidado dentro del de
+  // arriba -- HTML no permite <form> dentro de <form>, y ademas este
+  // necesita enctype='multipart/form-data' para poder subir un archivo).
+  html += "<div class='card'>";
+  html += "<h2>Backup / Restore</h2>";
+  html += "<p>El archivo de backup incluye las passwords de las redes WiFi, del portal y de OTA <b>en claro (sin cifrar)</b> -- gu&aacute;rdalo con el mismo cuidado que una password.</p>";
+  html += "<p><a href='/backup'>Descargar backup (JSON)</a></p>";
+  html += "<form method='POST' action='/restore' enctype='multipart/form-data'>";
+  html += "<input type='file' name='backupfile' accept='.json,application/json'> ";
+  html += "<input type='submit' value='Restaurar backup'>";
+  html += "<p><i>Restaurar sobrescribe las redes WiFi, las credenciales del portal y la MAC personalizada con lo que traiga el archivo, y reinicia el ESP.</i></p>";
+  html += "</form>";
+  html += "</div>";
+
+  html += "<script src='/app.js'></script>";
+  html += pageFoot();
 
   webServer.send(200, "text/html", html);
 }
@@ -1244,8 +1883,9 @@ void handleLog() {
       if (evLog[idx].level < minLevel) continue;
       if (!first) json += ",";
       first = false;
-      // Escape minimo de comillas/backslash -- los textos los generamos
-      // nosotros mismos con evLogf(), no vienen de entrada de usuario.
+      // Escape minimo de comillas/backslash para que el JSON no se rompa
+      // (esto es para el propio JSON, no para HTML -- ver htmlEscape() en
+      // la vista normal de esta pagina para ese otro caso).
       String text = evLog[idx].text;
       text.replace("\\", "\\\\");
       text.replace("\"", "\\\"");
@@ -1259,6 +1899,7 @@ void handleLog() {
   }
 
   String html = pageHead("Log ESP", "Log de eventos del ESP", "<meta http-equiv='refresh' content='2'>");
+  html += "<div class='card'>";
   html += "<p>Eventos totales desde el arranque: " + String(evLogTotal) +
           " (avisos: " + String(evLogWarnTotal) + ", errores: " + String(evLogErrorTotal) + ")";
   if (evLogTotal > EVLOG_LINES) {
@@ -1284,13 +1925,13 @@ void handleLog() {
     html += "<span class='" + String(evLogLevelClass(evLog[idx].level)) + "'>";
     html += "[+" + String(ageMs / 1000) + "." + String((ageMs % 1000) / 100) + "s] ";
     html += "[" + String(evLogLevelName(evLog[idx].level)) + "] ";
-    html += evLog[idx].text;
+    html += htmlEscape(String(evLog[idx].text)); // ver htmlEscape(): el texto puede incluir un SSID ajeno (escaneo), no es todo generado por nosotros
     html += "</span>\n";
   }
   if (!any) {
     html += (evLogCount == 0) ? "(todavia no hay eventos registrados)" : "(ningun evento cumple el filtro de nivel actual)";
   }
-  html += "</p></body></html>";
+  html += "</p></div>" + pageFoot();
 
   webServer.send(200, "text/html", html);
 }
@@ -1317,13 +1958,16 @@ void handleSniffer() {
   else if (dirArg == "esp") dirFilter = SNIFF_DIR_TX_TO_MEGA;    // solo ESP->Mega
 
   String html = pageHead("Sniffer", "Sniffer Serial ESP&lt;-&gt;Mega", "<meta http-equiv='refresh' content='2'>");
+  html += "<div class='card'>";
   html += "<p>Estado: " + String(sniffOn ? "ACTIVO (capturando)" : "PAUSADO") + "</p>";
   html += "<p>Bytes crudos totales desde el arranque: " + String(totalRawBytesFromMega) + "</p>";
   html += "<p>Frames descartados por checksum de framing: " + String(framesRxChkFailFromMega) + "</p>";
   html += "<p><a href='/sniffer?on=1'>Reiniciar captura</a> | <a href='/sniffer?off=1'>Pausar</a> | ";
   html += (showRaw ? "<a href='/sniffer'>Ver decodificado</a>" : "<a href='/sniffer?raw=1'>Ver hex plano</a>");
   html += " | <a href='/'>Volver</a></p>";
+  html += "</div>";
 
+  html += "<div class='card'>";
   if (showRaw) {
     html += "<h3>Bytes crudos capturados (hex, orden cronologico, un solo sentido Mega-&gt;ESP)</h3>";
     html += "<p>Util solo para saber si hay comunicacion fisica en absoluto; para ver el protocolo, usa la vista decodificada.</p>";
@@ -1352,7 +1996,8 @@ void handleSniffer() {
     html += decodeSniffFrameLog(dirFilter);
     html += "</p>";
   }
-  html += "</body></html>";
+  html += "</div>";
+  html += pageFoot();
 
   webServer.send(200, "text/html", html);
 }
@@ -1371,11 +2016,107 @@ void handleTest() {
   }
 
   String html = pageHead("Prueba de enlace", "Prueba de enlace Mega↔ESP");
+  html += "<div class='card'>";
   html += "<p>Envía un frame de prueba al Mega para comprobar que el canal Serie funciona.</p>";
   html += "<p><a href='/test?send=1'>Enviar frame de prueba</a></p>";
   html += "<p>Último frame visto del Mega: tipo=0x" + String(lastMegaFrameType, HEX) + ", len=" + String(lastMegaFrameLen) + "</p>";
-  html += "</body></html>";
+  html += "</div>";
+  html += pageFoot();
   webServer.send(200, "text/html", html);
+}
+
+// ---------------------------------------------------------------------
+// Panel de clientes Z21 (/clients) -- ver Z21Client / trackClient() mas
+// arriba para como se rellena esta tabla.
+// ---------------------------------------------------------------------
+void handleClients() {
+  if (!checkWebAuth()) return;
+
+  String html = pageHead("Clientes Z21", "Clientes Z21");
+  html += "<div class='card'>";
+  html += "<p class='muted'>Un cliente se marca <b>Desconectado</b> si no manda nada en " + String(CLIENT_TIMEOUT_MS / 1000) + " segundos. ";
+  html += "La MAC solo se puede ver cuando el ESP esta en modo AP (el cliente conectado directamente a el); en modo STA (conectado a tu router) no hay forma de obtenerla, se identifica solo por IP -- si a ese cliente le cambia la IP, se vera como un cliente nuevo distinto.</p>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  bool any = false;
+  html += "<table><tr><th>Estado</th><th>Nombre</th><th>IP</th><th>MAC</th><th>Visto hace</th><th>Acci&oacute;n</th></tr>";
+  for (uint8_t i = 0; i < MAX_TRACKED_CLIENTS; i++) {
+    if (!z21Clients[i].inUse) continue;
+    any = true;
+    Z21Client &c = z21Clients[i];
+    bool online = (c.lastSeenMs != 0) && (millis() - c.lastSeenMs < CLIENT_TIMEOUT_MS);
+
+    html += "<tr><td>";
+    html += online ? "<span class='ok'>&#9679; Conectado</span>" : "<span class='muted'>&#9675; Desconectado</span>";
+    html += "</td><td>" + (c.hasName ? htmlEscape(String(c.name)) : String("<span class='muted'>(sin nombre)</span>"));
+    html += "</td><td>" + c.ip.toString();
+    html += "</td><td>" + (c.keyIsMac ? macToString(c.mac) : String("<span class='muted'>N/D</span>"));
+    html += "</td><td>" + (c.lastSeenMs == 0 ? String("nunca en este arranque") : String((millis() - c.lastSeenMs) / 1000) + "s");
+    html += "</td><td>";
+    html += "<form class='inline-form' method='POST' action='/clients/save'>";
+    html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+    html += "<input type='text' name='name' value='" + (c.hasName ? htmlEscape(String(c.name)) : String("")) + "' placeholder='nombre'>";
+    html += "<input type='submit' value='Guardar'>";
+    html += "</form>";
+    if (c.hasName) {
+      html += "<form class='inline-form' method='POST' action='/clients/forget'>";
+      html += "<input type='hidden' name='idx' value='" + String(i) + "'>";
+      html += "<input type='submit' value='Olvidar'>";
+      html += "</form>";
+    }
+    html += "</td></tr>";
+  }
+  html += "</table>";
+  if (!any) {
+    html += "<p class='muted'>Todav&iacute;a no se ha visto ning&uacute;n cliente Z21 en este arranque.</p>";
+  }
+  html += "</div>";
+  html += pageFoot();
+
+  webServer.send(200, "text/html", html);
+}
+
+void handleClientSave() {
+  if (!checkWebAuth()) return;
+
+  if (webServer.hasArg("idx")) {
+    int idx = webServer.arg("idx").toInt();
+    if (idx >= 0 && idx < MAX_TRACKED_CLIENTS && z21Clients[idx].inUse) {
+      String name = webServer.hasArg("name") ? webServer.arg("name") : "";
+      name.trim();
+      if (name.length() > 0) {
+        name.toCharArray(z21Clients[idx].name, CLIENT_NAME_LEN + 1);
+        z21Clients[idx].hasName = true;
+        saveClientNamesToEeprom();
+        evLogf("[CLIENTS] Nombre asignado a cliente #%d: %s", idx, z21Clients[idx].name);
+      }
+    }
+  }
+
+  webServer.sendHeader("Location", "/clients");
+  webServer.send(303, "text/plain", "");
+}
+
+void handleClientForget() {
+  if (!checkWebAuth()) return;
+
+  if (webServer.hasArg("idx")) {
+    int idx = webServer.arg("idx").toInt();
+    if (idx >= 0 && idx < MAX_TRACKED_CLIENTS && z21Clients[idx].inUse) {
+      bool online = (z21Clients[idx].lastSeenMs != 0) && (millis() - z21Clients[idx].lastSeenMs < CLIENT_TIMEOUT_MS);
+      z21Clients[idx].hasName = false;
+      z21Clients[idx].name[0] = '\0';
+      if (!online) {
+        z21Clients[idx].inUse = false; // libera el hueco del todo si ya no esta conectado
+      }
+      saveClientNamesToEeprom();
+      evLogf("[CLIENTS] Nombre olvidado para cliente #%d", idx);
+    }
+  }
+
+  webServer.sendHeader("Location", "/clients");
+  webServer.send(303, "text/plain", "");
 }
 
 void handleSave() {
@@ -1432,6 +2173,19 @@ void handleSave() {
     }
   }
 
+  // Password de OTA -- mismo patron de doble campo, pero en su propia
+  // seccion de EEPROM (ver EEPROM_ADDR_OTAPASS_VALID mas arriba).
+  if (webServer.hasArg("otapass") && webServer.arg("otapass").length() > 0) {
+    String p1 = webServer.arg("otapass");
+    String p2 = webServer.hasArg("otapass2") ? webServer.arg("otapass2") : "";
+    if (p1 == p2) {
+      p1.toCharArray(cfgOtaPass, EEPROM_ADDR_OTAPASS_LEN + 1);
+      evLogfL(LOG_LVL_WARN, "[CFG] Password de OTA actualizada");
+    } else {
+      evLogfL(LOG_LVL_ERROR, "[CFG] Las dos passwords de OTA no coinciden -- se ignora, se mantiene la anterior");
+    }
+  }
+
   saveConfig();
   evLogf("[CFG] Configuracion guardada (SSID1=%s, SSID2=%s, SSID3=%s), reiniciando...", cfgSSID[0], cfgSSID[1], cfgSSID[2]);
 
@@ -1440,13 +2194,65 @@ void handleSave() {
   ESP.restart();
 }
 
+// ---------------------------------------------------------------------
+// OTA (actualizacion de firmware por WiFi, sin cable USB)
+// ---------------------------------------------------------------------
+// Estandar del core ESP8266 (ArduinoOTA): en el IDE de Arduino, con el
+// ESP en la misma red, aparece como un "puerto de red" ademas del puerto
+// serie de siempre -- se selecciona igual que un puerto USB y "Subir"
+// manda el firmware por WiFi en vez de por cable.
+//
+// Password: cfgOtaPass, SEPARADA de la password del portal (ver comentario
+// junto a EEPROM_ADDR_OTAPASS mas arriba) -- flashear firmware es un
+// privilegio distinto a solo ver/editar la configuracion.
+//
+// Si el usuario cambia esta password desde /save, se relee en el
+// siguiente arranque (handleSave() ya reinicia el ESP tras guardar, asi
+// que no hace falta refrescar ArduinoOTA en caliente).
+String otaHostname; // se rellena en setupOTA(); tambien se muestra en el estado del portal
+
+void setupOTA() {
+  otaHostname = "z21emulator-" + String(ESP.getChipId(), HEX);
+  ArduinoOTA.setHostname(otaHostname.c_str());
+  ArduinoOTA.setPassword(cfgOtaPass);
+
+  ArduinoOTA.onStart([]() {
+    String tipo = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "sistema de archivos (LittleFS/SPIFFS)";
+    evLogf("[OTA] Actualizacion iniciada (%s) -- no apagar ni desconectar hasta que termine", tipo.c_str());
+  });
+  ArduinoOTA.onEnd([]() {
+    evLogf("[OTA] Actualizacion completada, reiniciando...");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    const char *reason = "desconocido";
+    switch (error) {
+      case OTA_AUTH_ERROR: reason = "password incorrecta"; break;
+      case OTA_BEGIN_ERROR: reason = "fallo al iniciar (sin espacio o flash mal particionada)"; break;
+      case OTA_CONNECT_ERROR: reason = "fallo de conexion"; break;
+      case OTA_RECEIVE_ERROR: reason = "fallo recibiendo datos"; break;
+      case OTA_END_ERROR: reason = "fallo al finalizar la escritura en flash"; break;
+    }
+    evLogfL(LOG_LVL_ERROR, "[OTA] Error (%d): %s", (int)error, reason);
+  });
+
+  ArduinoOTA.begin();
+  evLogf("[OTA] Listo. Hostname='%s', password propia de OTA (distinta de la del portal)", otaHostname.c_str());
+}
+
 void setupWebServer() {
   webServer.on("/", handleRoot);
   webServer.on("/save", HTTP_POST, handleSave);
   webServer.on("/sniffer", handleSniffer);
   webServer.on("/log", handleLog);
   webServer.on("/test", handleTest);
+  webServer.on("/clients", handleClients);
+  webServer.on("/clients/save", HTTP_POST, handleClientSave);
+  webServer.on("/clients/forget", HTTP_POST, handleClientForget);
   webServer.on("/style.css", handleStyleCss);
+  webServer.on("/app.js", handleAppJs);
+  webServer.on("/scan", handleScan);
+  webServer.on("/backup", handleBackup);
+  webServer.on("/restore", HTTP_POST, handleRestoreDone, handleRestoreUpload);
   // TODO: endpoint websocket para el volcado de tramas (fase 2, mas
   // adelante — de momento la pagina /sniffer con auto-refresh es
   // suficiente para depurar el enlace Mega<->ESP)
@@ -1483,10 +2289,12 @@ void setup() {
   evLogf("[UDP] Servidor Z21 escuchando en puerto %d", Z21_UDP_PORT);
   setupWebServer();
   evLogf("[WEB] Servidor web listo en puerto 80");
+  setupOTA();
 }
 
 void loop() {
   handleZ21Udp();
   webServer.handleClient();
   maybeRetrySTA(); // si estamos en AP fallback, reintenta STA cada WIFI_STA_RETRY_INTERVAL_MS
+  ArduinoOTA.handle();
 }

@@ -106,10 +106,46 @@ void XpressNetTractionBackend::setLocoDrive(uint16_t addr, uint8_t stepsCode, ui
   loco->pendingBusConfirmation = true;
 }
 
+// Aplica F29-F68 (index 29-68) SOLO al LocoState en RAM — ver punto 6 de
+// "ASUNCIONES A VALIDAR" en el .h. index 0-28 nunca llega aquí (se
+// filtra antes en setLocoFunction()); esta función asume ese rango.
+// Mismo orden de bits que applySingleFunction() del backend dummy
+// (bit0 = función más baja del grupo correspondiente).
+static void applySingleFunctionLocalOnly(LocoState *loco, uint8_t index, FunctionOp op) {
+  uint8_t *targetByte;
+  uint8_t bitPos;
+  if (index <= 36) {
+    targetByte = &loco->f29to36; bitPos = index - 29;
+  } else if (index <= 44) {
+    targetByte = &loco->f37to44; bitPos = index - 37;
+  } else if (index <= 52) {
+    targetByte = &loco->f45to52; bitPos = index - 45;
+  } else if (index <= 60) {
+    targetByte = &loco->f53to60; bitPos = index - 53;
+  } else if (index <= 68) {
+    targetByte = &loco->f61to68; bitPos = index - 61;
+  } else {
+    return; // fuera de rango — no debería llegar aquí (TTNNNNNN son 6 bits, máx 63)
+  }
+  uint8_t mask = (uint8_t)(1 << bitPos);
+  if (op == FunctionOp::Off) *targetByte &= ~mask;
+  else if (op == FunctionOp::On) *targetByte |= mask;
+  else *targetByte ^= mask; // Toggle
+}
+
 void XpressNetTractionBackend::setLocoFunction(uint16_t addr, uint8_t index, FunctionOp op) {
   uint8_t adrHigh = (uint8_t)((addr >> 8) & 0x3F);
   uint8_t adrLow = (uint8_t)(addr & 0xFF);
-  XpressNet.setLocoFunc(adrHigh, adrLow, static_cast<uint8_t>(op), index);
+  if (index <= 28) {
+    XpressNet.setLocoFunc(adrHigh, adrLow, static_cast<uint8_t>(op), index);
+    return;
+  }
+  // F29-F63 (ver punto 6 de "ASUNCIONES A VALIDAR" en el .h): no hay
+  // forma de mandar esto por esta librería/X-Bus, así que solo se
+  // actualiza el LocoState en RAM — mismo patrón que setExtAccessory().
+  if (op == static_cast<FunctionOp>(0b11)) return; // "no permitido", igual que el dummy
+  LocoState *loco = locos_.findOrAlloc(addr);
+  applySingleFunctionLocalOnly(loco, index, op);
 }
 
 void XpressNetTractionBackend::setLocoFunctionGroup(uint16_t addr, FunctionGroup group, uint8_t value) {
@@ -129,6 +165,34 @@ void XpressNetTractionBackend::setLocoFunctionGroup(uint16_t addr, FunctionGroup
     case FunctionGroup::F21toF28:
       XpressNet.setFunc21to28(addr, value);
       break;
+    // F29-F68 (grupos 6-10): ver punto 6 de "ASUNCIONES A VALIDAR" en el
+    // .h — la librería no tiene ningún setFuncNtoM() para esto, así que
+    // solo se actualiza el LocoState en RAM, nada sale hacia la vía.
+    case FunctionGroup::F29toF36: {
+      LocoState *loco = locos_.findOrAlloc(addr);
+      loco->f29to36 = value;
+      break;
+    }
+    case FunctionGroup::F37toF44: {
+      LocoState *loco = locos_.findOrAlloc(addr);
+      loco->f37to44 = value;
+      break;
+    }
+    case FunctionGroup::F45toF52: {
+      LocoState *loco = locos_.findOrAlloc(addr);
+      loco->f45to52 = value;
+      break;
+    }
+    case FunctionGroup::F53toF60: {
+      LocoState *loco = locos_.findOrAlloc(addr);
+      loco->f53to60 = value;
+      break;
+    }
+    case FunctionGroup::F61toF68: {
+      LocoState *loco = locos_.findOrAlloc(addr);
+      loco->f61to68 = value;
+      break;
+    }
   }
 }
 
@@ -141,6 +205,68 @@ void XpressNetTractionBackend::requestLocoRefresh(uint16_t addr) {
 
 const LocoState *XpressNetTractionBackend::getLocoState(uint16_t addr) {
   return locos_.findOrAlloc(addr);
+}
+
+// LAN_X_PURGE_LOCO (PDF 4.6). A diferencia de la limitación de
+// setExtAccessory() más arriba, aquí NO hace falta ninguna nota especial:
+// Digital-MoBa/XpressNet no implementa un bucle de refresco periódico de
+// comandos de tracción por su cuenta (cada setLocoDrive()/setLocoFunction*
+// de este backend es un envío puntual disparado por la app Z21, no algo
+// que se repita solo), así que "purgar" no tiene nada que cancelar en el
+// bus — el único efecto real y honesto que podemos dar es olvidar la
+// caché local, igual que en DummyTractionBackend.
+void XpressNetTractionBackend::purgeLoco(uint16_t addr) {
+  locos_.release(addr);
+}
+
+void XpressNetTractionBackend::setTurnout(uint16_t addr, bool output, bool activate) {
+  uint8_t adrHigh = (uint8_t)((addr >> 8) & 0xFF); // sin enmascarar: dirección
+  uint8_t adrLow = (uint8_t)(addr & 0xFF);          // de accesorio, no de loco
+  // Formato de 'Pos' — ver punto 4 de "ASUNCIONES A VALIDAR" en el .h.
+  uint8_t pos = (uint8_t)((activate ? 0x08 : 0x00) | (output ? 0x01 : 0x00));
+  XpressNet.setTrntPos(adrHigh, adrLow, pos);
+  // No se actualiza accessories_ aquí a ciegas, igual que setLocoDrive no
+  // actualiza locos_: el estado confirmado llega por notifyTrnt/onTrnt
+  // cuando el bus responde de verdad. getTurnoutState() mientras tanto
+  // sigue devolviendo el último valor conocido.
+}
+
+void XpressNetTractionBackend::requestTurnoutRefresh(uint16_t addr) {
+  uint8_t adrHigh = (uint8_t)((addr >> 8) & 0xFF);
+  uint8_t adrLow = (uint8_t)(addr & 0xFF);
+  XpressNet.getTrntInfo(adrHigh, adrLow);
+}
+
+const AccessoryState *XpressNetTractionBackend::getTurnoutState(uint16_t addr) {
+  return accessories_.findOrAlloc(addr);
+}
+
+// Ver punto 5 de "ASUNCIONES A VALIDAR" en el .h: Digital-MoBa/XpressNet
+// no expone ningún método para el paquete DCCext (extended accessory
+// decoder, RCN-213) que necesita LAN_X_SET_EXT_ACCESSORY — solo tiene
+// setTrntPos() para el paquete "basic accessory decoder" de 2 salidas
+// (el mismo que ya usa setTurnout() más arriba). Por eso esta v1 SOLO
+// actualiza el estado en RAM: la app Z21 obtiene una respuesta correcta
+// y consistente (LAN_X_EXT_ACCESSORY_INFO con el último valor mandado),
+// pero no se envía nada real hacia la MultiMaus/vía. Esto es DISTINTO de
+// pendingBusConfirmation (locos) o de "esperar la respuesta async del
+// bus" (turnouts normales, ver onTrnt): aquí no hay bus que consultar en
+// absoluto con esta librería, así que hasData se marca true de inmediato
+// — es el último comando aceptado por esta central, no una confirmación
+// de que un decodificador físico lo haya recibido.
+void XpressNetTractionBackend::setExtAccessory(uint16_t rawAddr, uint8_t state) {
+  ExtAccessoryState *ext = extAccessories_.findOrAlloc(rawAddr);
+  ext->state = state;
+  ext->hasData = true;
+}
+
+void XpressNetTractionBackend::requestExtAccessoryRefresh(uint16_t rawAddr) {
+  (void)rawAddr; // no-op: no hay forma de consultar esto en el bus real
+                 // con esta librería (ver comentario de setExtAccessory).
+}
+
+const ExtAccessoryState *XpressNetTractionBackend::getExtAccessoryState(uint16_t rawAddr) {
+  return extAccessories_.findOrAlloc(rawAddr);
 }
 
 void XpressNetTractionBackend::onXNetStatus(uint8_t ledState) {
@@ -176,6 +302,12 @@ void XpressNetTractionBackend::onLokAll(uint8_t adrHigh, uint8_t adrLow, bool bu
   loco->pendingBusConfirmation = false;
 }
 
+void XpressNetTractionBackend::onTrnt(uint8_t adrHigh, uint8_t adrLow, uint8_t pos) {
+  uint16_t addr = ((uint16_t)adrHigh << 8) | adrLow; // sin enmascarar, ver setTurnout()
+  AccessoryState *acc = accessories_.findOrAlloc(addr);
+  acc->position = static_cast<AccessoryPosition>(pos & 0x03);
+}
+
 // ---------------------------------------------------------------------
 // Callbacks "weak" de la librería XpressNetClass (espacio de nombres
 // global, ver XpressNet.h) — solo pueden existir UNA vez en todo el
@@ -198,6 +330,12 @@ void notifyLokAll(uint8_t Adr_High, uint8_t Adr_Low, boolean Busy, uint8_t Steps
   if (g_activeXpressNetBackend) {
     g_activeXpressNetBackend->onLokAll(Adr_High, Adr_Low, Busy, Steps, Speed,
                                         Direction, F0, F1, F2, F3, Req);
+  }
+}
+
+void notifyTrnt(uint8_t Adr_High, uint8_t Adr_Low, uint8_t Pos) {
+  if (g_activeXpressNetBackend) {
+    g_activeXpressNetBackend->onTrnt(Adr_High, Adr_Low, Pos);
   }
 }
 

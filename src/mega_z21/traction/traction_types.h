@@ -53,6 +53,18 @@ struct LocoState {
   uint8_t f5to12 = 0;     // DB5: F5=bit0 ... F12=bit7
   uint8_t f13to20 = 0;    // DB6: F13=bit0 ... F20=bit7
   uint8_t f21to28 = 0;    // DB7: F21=bit0 ... F28=bit7
+  // Grupos 6-10 (PDF 4.3.2, ampliación Z21 FW V1.42): mismo orden de
+  // bits que la tabla del PDF (bit0 = función más baja del grupo). Solo
+  // f29to36 llega a viajar de vuelta a la app (bits 0-2 = F29-F31, ver
+  // sendLocoInfoResponse() en mega_z21.ino y el comentario de
+  // FunctionGroup en traction_backend.h) — f37to44 en adelante se guardan
+  // igual aquí por si algún backend futuro los necesita, pero el PDF es
+  // explícito en que NO hay feedback de vuelta al cliente LAN para esos.
+  uint8_t f29to36 = 0;
+  uint8_t f37to44 = 0;
+  uint8_t f45to52 = 0;
+  uint8_t f53to60 = 0;
+  uint8_t f61to68 = 0;
   // true mientras se espera la primera respuesta real del bus físico para
   // esta loco (solo lo usan backends asíncronos, p.ej. XpressNet). El
   // núcleo Z21 puede usarlo para decidir si loguear "dato aún no
@@ -70,6 +82,77 @@ struct TrackState {
   bool emergencyStop = false;
   bool shortCircuit = false;
   bool serviceModeActive = false;
+};
+
+// Nº de accesorios (agujas, señales de 2 aspectos, desacopladores,
+// descarriladores biestables...) que se recuerdan en RAM simultáneamente.
+// El PDF oficial (sección 5, "Switching") es explícito en que el mismo
+// comando sirve para "una aguja (o cualquier función de conmutación)" —
+// no hay un tipo "aguja" distinto de "señal" a nivel de protocolo Z21
+// LAN_X_GET/SET_TURNOUT, ambos son un decodificador de accesorios DCC de
+// 2 salidas. Señales de más de 2 aspectos necesitan LAN_X_SET_EXT_
+// ACCESSORY (PDF sección 5.4) — TODO, no implementado todavía (ver
+// AGENT.md).
+#define MAX_TRACKED_ACCESSORIES 16
+
+// ZZ de LAN_X_TURNOUT_INFO (PDF sección 5.3): posición conocida de un
+// accesorio. NotSwitched es el valor inicial antes de que llegue ningún
+// comando o confirmación del bus para esa dirección.
+enum class AccessoryPosition : uint8_t {
+  NotSwitched = 0b00, // aún no se ha conmutado desde el arranque
+  Output1 = 0b01,      // conmutado a la salida 1 (P=0 en LAN_X_SET_TURNOUT)
+  Output2 = 0b10,      // conmutado a la salida 2 (P=1)
+  Invalid = 0b11        // posición inválida (p.ej. ambas salidas activas a la vez)
+};
+
+// Estado de UN accesorio, en el formato que usa el protocolo Z21 LAN_X
+// (ver PDF 5.1-5.3). address usa el rango completo de 16 bits sin
+// enmascarar (a diferencia de LocoState::address, ver PDF sección 5.1:
+// "Function address = (FAdr_MSB << 8) + FAdr_LSB", sin el "& 0x3F" que sí
+// lleva la dirección de loco en 4.4) — por eso 0 SÍ es una dirección de
+// accesorio válida, y el "slot libre" se marca con 0xFFFF en vez de 0
+// (ver accessory_state_store.h).
+struct AccessoryState {
+  uint16_t address = 0xFFFF; // 0xFFFF = slot libre
+  AccessoryPosition position = AccessoryPosition::NotSwitched;
+};
+
+// Nº de accesorios EXTENDIDOS (señales de más de 2 aspectos, decodificadores
+// DCCext según RCN-213) que se recuerdan en RAM simultáneamente. Tabla
+// separada de MAX_TRACKED_ACCESSORIES a propósito: son dos espacios de
+// direcciones DISTINTOS a nivel de protocolo Z21 (ver más abajo), así que
+// mezclar ambos en una sola tabla confundiría direcciones que en realidad
+// no tienen relación entre sí.
+#define MAX_TRACKED_EXT_ACCESSORIES 8
+
+// Estado de UN accesorio extendido, en el formato que usa LAN_X_SET_EXT_
+// ACCESSORY / LAN_X_EXT_ACCESSORY_INFO (PDF sección 5.4-5.6, "extended
+// accessory decoder package format" DCCext, ver también RCN-213).
+//
+// DIFERENCIA CLAVE con AccessoryState (turnouts normales, sección 5.1-5.3):
+// - Direccionamiento: aquí 'address' es la RawAddress según RCN-213 tal
+//   cual — el primer decodificador extendido tiene RawAddress=4 (se
+//   muestra como "dirección 1" en las UIs de usuario), SIN la conversión
+//   a puerto/salida (FAdr>>2, etc.) que sí aplica la sección 5 a los
+//   turnouts normales de 2 salidas. Son direcciones de espacios distintos
+//   aunque ambas quepan en 16 bits — no intercambiables entre sí.
+// - Estado: no es una posición de 2 bits (ZZ), sino un byte completo
+//   DDDDDDDD (0-255) que se transmite tal cual al decodificador en el
+//   paquete DCCext. Su significado concreto (aspecto de señal, tiempo de
+//   activación de una aguja con "switching time"...) lo decide el
+//   decodificador receptor, no el protocolo Z21 — ver PDF 5.4 para los
+//   dos casos de referencia documentados (Z21 switch/signal DECODER).
+struct ExtAccessoryState {
+  uint16_t address = 0xFFFF; // RawAddress; 0xFFFF = slot libre (0 SÍ es
+                              // válida en RCN-213, igual que en AccessoryState)
+  uint8_t state = 0;         // DDDDDDDD: último valor mandado/conocido
+  // false hasta que llega el primer LAN_X_SET_EXT_ACCESSORY para esta
+  // dirección (o una confirmación real del bus, si el backend algún día
+  // puede leerla) — controla el byte "Status" de LAN_X_EXT_ACCESSORY_INFO
+  // (PDF 5.6: 0x00=Data Valid, 0xFF=Data Unknown). Antes del primer SET,
+  // un GET_EXT_ACCESSORY_INFO debe poder reportar honestamente "no lo sé
+  // todavía" en vez de inventar un 0x00 (Stop) que nadie mandó de verdad.
+  bool hasData = false;
 };
 
 #endif // TRACTION_TYPES_H

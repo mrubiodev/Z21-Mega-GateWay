@@ -1,3 +1,54 @@
+### C++
+# Object files
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Static libraries
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Debug files
+*.dSYM/
+*.idb
+*.pdb
+
+### Objective-C
+# Xcode user settings
+xcuserdata/
+
+# Xcode build data
+DerivedData/
+
+# Obj-C/Swift specific
+*.hmap
+
+# App packaging
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
 ### Windows
 # Windows thumbnail cache files
 Thumbs.db
@@ -10,3 +61,4 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+ingieneria_inversa
