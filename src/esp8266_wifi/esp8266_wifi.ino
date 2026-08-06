@@ -253,15 +253,20 @@ bool evLogThrottle(unsigned long &lastMs, unsigned long minIntervalMs) {
 // (no junto al resto de cosas de clientes, mas abajo) porque hacen falta
 // para calcular el tamaño de esta seccion de EEPROM.
 //
-// 16 es un numero arbitrario, no un limite de hardware/RAM: cada entrada
-// son ~44 bytes en RAM (trivial) y 32 en EEPROM, asi que subirlo mas
-// (32, 50...) seguiria siendo barato -- se puede subir sin miedo si hacen
-// falta mas. El cuello de botella real para muchos clientes activos a la
-// vez NO esta aqui, esta en el enlace serie unico hacia el Mega (un solo
-// canal, un solo microcontrolador procesando comandos uno detras de
-// otro) -- eso no lo arregla agrandar esta tabla, ver comentario junto a
-// CLIENT_REPLY_QUEUE_LEN mas abajo.
-#define MAX_TRACKED_CLIENTS 16
+// Desde v0.11 este numero YA NO es arbitrario del todo: MAX_TRACKED_CLIENTS
+// es tambien el tamaño del espacio de client-id que viaja por el framing
+// FRAME_TYPE_Z21 (1 byte, ver z21_protocol.h) y clientBroadcastFlags[] en
+// el Mega usa el mismo indice -- por eso se define literalmente como
+// Z21_MAX_CLIENTS (la constante compartida) en vez de un 16 propio: si se
+// sube aqui hay que subir Z21_MAX_CLIENTS en las 3 copias de
+// z21_protocol.h y el array clientBroadcastFlags[] del Mega a la vez, o
+// un client-id valido en un lado se saldria de rango en el otro. Cada
+// entrada de esta tabla son ~44 bytes en RAM (trivial) y 32 en EEPROM, asi
+// que subirlo (32, 50...) sigue siendo barato en RAM/EEPROM -- el cuello
+// de botella real para muchos clientes activos a la vez sigue sin estar
+// aqui, sino en el enlace serie unico hacia el Mega (un solo canal, un
+// solo microcontrolador procesando comandos uno detras de otro).
+#define MAX_TRACKED_CLIENTS Z21_MAX_CLIENTS
 #define CLIENT_NAME_LEN 24
 #define EEPROM_CLIENT_RECORD_LEN (1 + 6 + (CLIENT_NAME_LEN + 1)) // keyIsMac + key + nombre
 #define EEPROM_ADDR_CLIENTS_VALID (EEPROM_ADDR_OTAPASS + EEPROM_ADDR_OTAPASS_LEN)
@@ -277,6 +282,13 @@ char cfgWebPass[EEPROM_ADDR_WEBPASS_LEN + 1] = "z21admin";
 bool cfgMacCustomEnabled = false;
 uint8_t cfgMacAddr[EEPROM_ADDR_MAC_LEN] = {0, 0, 0, 0, 0, 0};
 char cfgOtaPass[EEPROM_ADDR_OTAPASS_LEN + 1] = "z21firmware"; // TODO: mismo aviso que cfgWebPass -- cambiar en cuanto se use en serio
+// Declarada aquí (no junto a setupOTA(), donde se rellena) porque handleRoot()
+// la usa y en un .ino de Arduino el preprocesador solo genera prototipos
+// automáticos para FUNCIONES, no para variables globales -- si esta línea
+// vuelve a bajar por debajo de handleRoot() en el archivo, la compilación
+// falla con "'otaHostname' was not declared in this scope" (bug real, ya
+// estaba así antes de v0.11, no relacionado con el cambio de multi-cliente).
+String otaHostname;
 
 // ---------------------------------------------------------------------
 // Estado de red
@@ -321,90 +333,43 @@ String restoreUploadBuffer;
 bool restoreUploadTooBig = false;
 
 // ---------------------------------------------------------------------
-// Soporte multi-cliente Z21
+// Soporte multi-cliente Z21 (v0.11)
 // ---------------------------------------------------------------------
-// ANTES: una sola variable global lastClientIP/lastClientPort, que se
-// sobreescribia con cada UDP entrante. Con un solo cliente Z21 conectado
-// (el caso normal hasta ahora) funciona perfecto -- pero con dos o mas
-// apps conectadas a la vez, si llegan peticiones de A y de B casi
-// seguidas, la respuesta que venga del Mega para A puede acabar
-// mandandose a B (quien sea que haya escrito ultimo en la variable),
-// simplemente por el orden de llegada, no por a quien correspondia.
+// HISTORIA: la v1 de esto era una sola variable global lastClientIP/
+// lastClientPort, que se sobreescribia con cada UDP entrante -- rota en
+// cuanto habia 2+ apps a la vez. Se sustituyo por una cola FIFO de
+// clientes pendientes de respuesta (heuristica: "el Mega responde en el
+// mismo orden en que pregunta"), una mejora real pero con un limite de
+// fondo que quedo documentado aqui mismo: el framing ESP<->Mega no
+// llevaba ningun identificador de cliente, asi que cualquier frame que el
+// Mega mandase SIN ser respuesta directa a la ultima peticion (un
+// broadcast real: LAN_X_BC_STOPPED, LAN_X_TURNOUT_INFO tras un cambio de
+// OTRO cliente, etc.) se enviaba solo al primero de la cola, nunca a los
+// demas clientes suscritos.
 //
-// ARREGLO (best-effort, sin tocar el Mega): en vez de "el ultimo", se
-// lleva una COLA FIFO de clientes pendientes de respuesta. Cada peticion
-// UDP reenviada al Mega empuja (IP, puerto) al final de la cola; cada
-// frame Z21 que vuelve del Mega hace pop del PRIMERO de la cola (asume
-// que el Mega procesa y responde en el mismo orden en que le llegan las
-// peticiones, que es like que su firmware sea de un solo hilo leyendo el
-// serie secuencialmente -- una mejora real sobre "el ultimo que hablo",
-// pero sigue siendo una heuristica).
+// v0.11 LO ARREGLA DE VERDAD: el framing FRAME_TYPE_Z21 ahora lleva 1
+// byte de CLIENT-ID delante del datagrama (ver z21_protocol.h). Ese
+// client-id ES el indice en z21Clients[] (la misma tabla de mas abajo,
+// ver trackClient()) -- no hay dos tablas paralelas que mantener
+// sincronizadas. Cuando llega un UDP, se llama a trackClient() para
+// obtener/asignar su slot y ese slot va en el frame que se manda al
+// Mega; cuando vuelve un frame FRAME_TYPE_Z21 del Mega, el primer byte
+// dice exactamente a que slot de z21Clients[] hay que mandarselo por UDP
+// -- ya no hay que adivinar nada, y el Mega puede mandar tantos frames
+// como clientes distintos necesite notificar (broadcasts de verdad),
+// cada uno con su propio client-id. La cola FIFO (replyQueue/
+// PendingReply) ya no hace falta y se ha quitado.
 //
-// LIMITE REAL DE ESTE ENFOQUE: el framing ESP<->Mega no lleva ningun
-// identificador de cliente. Si el Mega alguna vez manda una respuesta sin
-// que le corresponda a la peticion que esta en la cabeza de la cola (por
-// ejemplo, un frame que en realidad es un broadcast a raiz de un cambio
-// de estado, no una respuesta directa a la ultima peticion), este frame
-// se enviaria igualmente al cliente equivocado. Una solucion robusta de
-// verdad necesitaria que el Mega etiquetase sus respuestas con un indice
-// de cliente en el framing -- eso SI implica tocar el Mega, y no se ha
-// hecho aqui a proposito (ver conversacion: "no tocar el Mega").
-//
-// Ademas: los mensajes de tipo BROADCAST del protocolo Z21 real (cambios
-// de estado de una loco, de la alimentacion de via, etc.) deberian
-// mandarse a TODOS los clientes conectados con el flag correspondiente
-// activado (ver LAN_SET_BROADCASTFLAGS en z21_protocol.h), no solo al que
-// esta en la cabeza de la cola -- eso tampoco esta implementado: hoy CADA
-// frame Z21 que vuelve del Mega se trata como respuesta directa a un solo
-// cliente. Con un solo cliente conectado (uso tipico hasta ahora) no se
-// nota; con varios apps a la vez, cada una podria dejar de ver los
-// cambios que provoquen las demas. Documentado como limitacion conocida.
-//
-// Este numero es sobre PETICIONES EN VUELO (mandadas al Mega, respuesta
-// aun no llegada), no sobre cuantos clientes puede haber en total -- eso
-// es MAX_TRACKED_CLIENTS, mas arriba, un contador distinto. En la
-// practica esta cola se vacia casi al instante (el Mega responde en el
-// mismo loop() o el siguiente), asi que ni con muchos clientes activos
-// deberia llenarse mientras el enlace serie vaya siguiendole el ritmo.
-// Subirlo es barato (unos pocos bytes por hueco) pero NO evita que el
-// enlace serie sea el cuello de botella real: sigue siendo un solo canal
-// y un solo microcontrolador (el Mega) procesando comandos uno detras de
-// otro, igual que en la central Z21 real -- mas clientes a la vez
-// escribiendo trenes significa mas comandos por segundo por ese mismo
-// canal, no una cola mas larga aqui.
-#define CLIENT_REPLY_QUEUE_LEN 16
-struct PendingReply {
-  IPAddress ip;
-  uint16_t port;
-};
-PendingReply replyQueue[CLIENT_REPLY_QUEUE_LEN];
-uint8_t replyQueueHead = 0;  // siguiente a sacar (pop)
-uint8_t replyQueueCount = 0;
-
-void replyQueuePush(IPAddress ip, uint16_t port) {
-  if (replyQueueCount >= CLIENT_REPLY_QUEUE_LEN) {
-    // Cola llena (demasiadas peticiones sin respuesta aun) -- se descarta
-    // la mas antigua para no bloquear indefinidamente; mejor perder una
-    // respuesta ocasional que dejar de aceptar peticiones nuevas.
-    replyQueueHead = (replyQueueHead + 1) % CLIENT_REPLY_QUEUE_LEN;
-    replyQueueCount--;
-    evLogfL(LOG_LVL_WARN, "[Z21] Cola de respuestas llena, se descarta la mas antigua");
-  }
-  uint8_t tail = (replyQueueHead + replyQueueCount) % CLIENT_REPLY_QUEUE_LEN;
-  replyQueue[tail].ip = ip;
-  replyQueue[tail].port = port;
-  replyQueueCount++;
-}
-
-// Devuelve true y rellena ip/port si habia algo en la cola; false si esta vacia.
-bool replyQueuePop(IPAddress &ip, uint16_t &port) {
-  if (replyQueueCount == 0) return false;
-  ip = replyQueue[replyQueueHead].ip;
-  port = replyQueue[replyQueueHead].port;
-  replyQueueHead = (replyQueueHead + 1) % CLIENT_REPLY_QUEUE_LEN;
-  replyQueueCount--;
-  return true;
-}
+// LIMITACION CONOCIDA: si trackClient() reasigna un slot por LRU (tabla
+// llena, se desaloja al cliente anonimo mas antiguo) justo mientras ese
+// slot tenia una peticion en vuelo hacia el Mega, la respuesta llegaria
+// dirigida al cliente NUEVO que ocupa ahora el slot, no al que hizo la
+// pregunta original. Es un caso raro (hacen falta MAX_TRACKED_CLIENTS
+// clientes simultaneos para que la tabla llegue a llenarse) y ya existia
+// en la practica con la cola FIFO anterior; no se ha resuelto del todo a
+// proposito, ver el comentario largo junto a Z21_MAX_CLIENTS en
+// z21_protocol.h para la solucion completa (un frame de reset de slot)
+// que NO se ha implementado aqui.
 
 // ---------------------------------------------------------------------
 // Registro de clientes (panel /clients): quien se ha conectado, con que
@@ -465,7 +430,13 @@ bool resolveStationMac(IPAddress ip, uint8_t *macOut) {
 // la tabla esta llena -- los clientes CON NOMBRE puesto nunca se
 // desalojan, para que el panel /clients los pueda seguir mostrando como
 // "Desconectado" en vez de perderlos.
-void trackClient(IPAddress ip, uint16_t port) {
+//
+// Devuelve el slot asignado (0..MAX_TRACKED_CLIENTS-1), o -1 si la tabla
+// esta llena de clientes con nombre y no hay hueco -- desde v0.11 este
+// valor de retorno importa de verdad: es el CLIENT_ID que se antepone al
+// frame FRAME_TYPE_Z21 que se manda al Mega (ver handleZ21Udp() y
+// z21_protocol.h), no solo un dato para el panel /clients como antes.
+int8_t trackClient(IPAddress ip, uint16_t port) {
   uint8_t mac[6];
   bool macKnown = resolveStationMac(ip, mac);
 
@@ -496,7 +467,7 @@ void trackClient(IPAddress ip, uint16_t port) {
       }
     }
   }
-  if (slot < 0) return; // tabla llena de clientes con nombre, no hay hueco -- se ignora este cliente nuevo
+  if (slot < 0) return -1; // tabla llena de clientes con nombre, no hay hueco -- se ignora este cliente nuevo
 
   z21Clients[slot].inUse = true;
   z21Clients[slot].ip = ip;
@@ -506,6 +477,7 @@ void trackClient(IPAddress ip, uint16_t port) {
     z21Clients[slot].keyIsMac = true;
     memcpy(z21Clients[slot].mac, mac, 6);
   }
+  return (int8_t)slot;
 }
 
 // ---------------------------------------------------------------------
@@ -959,11 +931,14 @@ uint8_t sniffFrameChronoIndex(uint8_t i) {
   return (start + i) % SNIFF_FRAME_LOG_SIZE;
 }
 
-// Decodifica el header de un datagrama Z21 LAN real (el payload de una
-// trama FRAME_TYPE_Z21): DataLen(2, LE) + Header(2, LE) + Data...
-// Solo se nombran los headers que ya son "fuente de verdad" en
-// z21_protocol.h -- el resto se muestra como "header no catalogado" en vez
-// de inventarse nombres, para no dar la sensación de soportar algo que en
+// Decodifica el header de un datagrama Z21 LAN real: DataLen(2, LE) +
+// Header(2, LE) + Data... IMPORTANTE (v0.11): recibe el datagrama Z21 YA
+// SIN el byte de CLIENT_ID que llevan las tramas FRAME_TYPE_Z21 en el
+// framing interno (ver z21_protocol.h) -- quien llame a esta función debe
+// pasar `payload + 1` / `len - 1`, no el payload crudo de la trama. Solo
+// se nombran los headers que ya son "fuente de verdad" en z21_protocol.h
+// -- el resto se muestra como "header no catalogado" en vez de
+// inventarse nombres, para no dar la sensación de soportar algo que en
 // realidad mega_z21.ino todavía no implementa.
 String z21CommandDescribe(const uint8_t *data, uint8_t len) {
   if (len < 4) return "datagrama Z21 demasiado corto para tener header";
@@ -992,7 +967,8 @@ String z21CommandDescribe(const uint8_t *data, uint8_t len) {
 }
 
 // Vista principal de /sniffer: tramas ya decodificadas, mas recientes
-// primero, con direccion, tipo y (si es FRAME_TYPE_Z21) el comando Z21.
+// primero, con direccion, tipo y (si es FRAME_TYPE_Z21) el cliente y el
+// comando Z21.
 // dirFilter: 0xFF = todas, o SNIFF_DIR_RX_FROM_MEGA / SNIFF_DIR_TX_TO_MEGA.
 String decodeSniffFrameLog(uint8_t dirFilter) {
   if (sniffFrameCount == 0) return "(sin tramas capturadas todavia)\n";
@@ -1010,7 +986,15 @@ String decodeSniffFrameLog(uint8_t dirFilter) {
              : "<span class='esp'>ESP-&gt;MEGA</span> ";
     out += "<b>" + String(frameTypeName(e.type)) + "</b> len=" + String(e.len);
     if (e.type == FRAME_TYPE_Z21) {
-      out += " :: " + z21CommandDescribe(e.payload, e.payloadLen);
+      // v0.11: el primer byte del payload es el CLIENT_ID (ver
+      // z21_protocol.h), no parte del datagrama Z21 -- se muestra aparte
+      // y se decodifica el resto a partir de payload+1.
+      if (e.payloadLen >= 1) {
+        out += " cliente=#" + String(e.payload[0]);
+        out += " :: " + z21CommandDescribe(e.payload + 1, e.payloadLen - 1);
+      } else {
+        out += " :: (frame Z21 sin ni siquiera el byte de cliente -- truncado o inválido)";
+      }
     }
     out += " data=";
     for (uint8_t k = 0; k < e.payloadLen; k++) {
@@ -1313,7 +1297,7 @@ void handleZ21Udp() {
     udpPacketsSeen++;
     lastUdpSourceIP = z21Udp.remoteIP();
     lastUdpSourcePort = z21Udp.remotePort();
-    trackClient(lastUdpSourceIP, lastUdpSourcePort);
+    int8_t clientSlot = trackClient(lastUdpSourceIP, lastUdpSourcePort);
     int len = z21Udp.read(udpBuf, UDP_BUF_SIZE);
 
     char hexPreview[3 * 16 + 1] = "";
@@ -1327,8 +1311,28 @@ void handleZ21Udp() {
            lastUdpSourceIP[0], lastUdpSourceIP[1], lastUdpSourceIP[2], lastUdpSourceIP[3],
            lastUdpSourcePort, len, hexPreview, (len > 16) ? "..." : "");
 
-    sendToMega(FRAME_TYPE_Z21, udpBuf, (uint8_t)len);
-    replyQueuePush(lastUdpSourceIP, lastUdpSourcePort);
+    // Desde v0.11 el payload que se manda al Mega lleva el client-id
+    // (el slot de z21Clients[] recién obtenido de trackClient()) delante
+    // del datagrama Z21 tal cual llegó — ver z21_protocol.h. Sin ese
+    // byte el Mega no tendría forma de saber a quién responder.
+    if (clientSlot < 0) {
+      // Tabla de clientes llena de clientes con nombre, sin hueco (ver
+      // trackClient()) -- no hay client-id que asignarle a esta petición,
+      // así que no se reenvía: aunque el Mega la respondiese, no habría
+      // forma de saber a qué IP/puerto devolverla.
+      evLogfL(LOG_LVL_WARN, "[Z21] Tabla de clientes llena, petición de %d.%d.%d.%d:%u descartada",
+              lastUdpSourceIP[0], lastUdpSourceIP[1], lastUdpSourceIP[2], lastUdpSourceIP[3], lastUdpSourcePort);
+    } else if (len > 254) {
+      // len+1 (client-id) tiene que caber en el byte LEN del framing
+      // interno (uint8_t, máx 255) -- un datagrama Z21 real nunca se
+      // acerca a este tamaño, esto es solo una guarda de seguridad.
+      evLogfL(LOG_LVL_WARN, "[Z21] Datagrama demasiado grande (%d bytes) para etiquetar con client-id -- descartado", len);
+    } else {
+      uint8_t framePayload[UDP_BUF_SIZE + 1];
+      framePayload[0] = (uint8_t)clientSlot;
+      memcpy(framePayload + 1, udpBuf, len);
+      sendToMega(FRAME_TYPE_Z21, framePayload, (uint8_t)(len + 1));
+    }
 
     // TODO (fase 2): si el sniffer está activo, también volcar este frame
     // por WebSocket antes/después de reenviarlo al Mega.
@@ -1346,18 +1350,26 @@ void handleZ21Udp() {
       // del watchdog): contestamos igual, sin volver a bloquear el UDP.
       buildAndSendNetInfo();
     } else if (megaType == FRAME_TYPE_Z21) {
-      IPAddress replyIp;
-      uint16_t replyPort;
-      if (replyQueuePop(replyIp, replyPort)) {
-        z21Udp.beginPacket(replyIp, replyPort);
-        z21Udp.write(megaBuf, megaLen);
-        z21Udp.endPacket();
+      // Primer byte = client-id (slot en z21Clients[]) al que va dirigido
+      // este frame -- ya NO se adivina por una cola FIFO (ver v0.11 más
+      // arriba). El ESP solo mira ese byte para enrutar, el resto del
+      // payload es el datagrama Z21 tal cual se manda por UDP, sin tocarlo.
+      if (megaLen < 1) {
+        evLogfL(LOG_LVL_WARN, "[Z21] Frame del Mega sin byte de client-id -- descartado");
       } else {
-        // No hay ningun cliente pendiente en la cola -- puede pasar si el
-        // Mega manda un frame Z21 que no es respuesta directa a nada (ver
-        // limitacion de broadcasts documentada junto a la cola FIFO mas
-        // arriba). Se descarta en vez de mandarlo a cualquiera.
-        evLogfL(LOG_LVL_WARN, "[Z21] Frame del Mega sin cliente pendiente en la cola -- descartado");
+        uint8_t clientId = megaBuf[0];
+        const uint8_t *z21Payload = megaBuf + 1;
+        uint8_t z21Len = megaLen - 1;
+        if (clientId >= MAX_TRACKED_CLIENTS || !z21Clients[clientId].inUse) {
+          // Cliente desconocido o ya desconectado (p.ej. se le echó de la
+          // tabla por LRU, o nunca existió ese slot) -- se descarta en vez
+          // de mandarlo a cualquiera.
+          evLogfL(LOG_LVL_WARN, "[Z21] Cliente #%u desconocido/desconectado -- frame descartado", clientId);
+        } else {
+          z21Udp.beginPacket(z21Clients[clientId].ip, z21Clients[clientId].lastPort);
+          z21Udp.write(z21Payload, z21Len);
+          z21Udp.endPacket();
+        }
       }
 
       // TODO (fase 2): volcar también esta respuesta por WebSocket si el
@@ -2209,7 +2221,7 @@ void handleSave() {
 // Si el usuario cambia esta password desde /save, se relee en el
 // siguiente arranque (handleSave() ya reinicia el ESP tras guardar, asi
 // que no hace falta refrescar ArduinoOTA en caliente).
-String otaHostname; // se rellena en setupOTA(); tambien se muestra en el estado del portal
+// otaHostname declarada arriba, junto a cfgOtaPass -- se rellena aquí.
 
 void setupOTA() {
   otaHostname = "z21emulator-" + String(ESP.getChipId(), HEX);

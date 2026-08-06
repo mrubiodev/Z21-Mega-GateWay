@@ -94,6 +94,66 @@
 #define FRAME_TYPE_SYNC_ACK 0x05
 
 // -----------------------------------------------------------------------
+// Client-id en el payload de FRAME_TYPE_Z21 (v0.20, soporte multi-cliente
+// real) -- NO cambia la capa de sync/checksum de arriba.
+// -----------------------------------------------------------------------
+// Desde v0.20 el payload de un frame FRAME_TYPE_Z21 deja de ser el
+// datagrama Z21 pelado y pasa a ser:
+//
+//   [CLIENT_ID(1)][datagrama Z21 tal cual iba/venía por UDP...]
+//
+// Sentido ESP->Mega: CLIENT_ID = índice de cliente en la tabla del ESP
+// (z21Clients[] / trackClient(), ver esp8266_wifi.ino) que mandó esa
+// petición UDP concreta.
+// Sentido Mega->ESP: CLIENT_ID = a qué cliente (mismo índice) va dirigido
+// este frame; el ESP simplemente lo reenvía por UDP a la IP/puerto de ese
+// índice — sigue sin interpretar el contenido Z21 ("el ESP solo
+// transporta", ver AGENT.md), el client-id es lo único que mira.
+// Esto SOLO afecta a FRAME_TYPE_Z21: HELLO/NET_INFO/SYNC_ACK/HEARTBEAT no
+// llevan cliente y no cambian de formato.
+//
+// MOTIVO: hasta v0.18/v0.19 el ESP adivinaba a qué cliente pertenecía
+// cada respuesta con una cola FIFO (heurística "el Mega responde en el
+// mismo orden en que pregunta", ver esos changelogs más abajo) y
+// CUALQUIER frame que el Mega mandase que no fuera respuesta directa a la
+// última petición (broadcasts reales: LAN_X_BC_STOPPED,
+// LAN_X_BC_TRACK_POWER_OFF/ON, LAN_X_TURNOUT_INFO,
+// LAN_X_EXT_ACCESSORY_INFO, LAN_X_LOCO_INFO tras un cambio) se enviaba
+// solo al primero de la cola, nunca a los demás clientes conectados. Con
+// client-id explícito, el Mega decide con precisión a quién responde de
+// forma directa y a quién notificar como broadcast (ver
+// clientBroadcastFlags[] en mega_z21.ino, que sustituye al antiguo valor
+// global único de broadcast flags).
+//
+// Los bits de LAN_SET_BROADCASTFLAGS / LAN_GET_BROADCASTFLAGS (PDF
+// oficial, sección 2.16) que el Mega ya sabe disparar de verdad de forma
+// selectiva por cliente. El resto de bits del protocolo real (RBus,
+// RailCom, CAN, LocoNet...) siguen sin implementar y se ignoran igual que
+// antes. NOTA: igual que otras asunciones de este repo, los valores de
+// estos bits están tomados de memoria del PDF oficial y no se han vuelto
+// a contrastar línea a línea contra el documento en este cambio.
+#define Z21_MAX_CLIENTS 16 // DEBE coincidir con MAX_TRACKED_CLIENTS (esp8266_wifi.ino, este sketch)
+#define CLIENT_ID_NONE 0xFF // "sin cliente concreto" (ver mega_z21.ino) — nunca es un slot válido real
+#define BCFLAG_BASIC 0x00000001UL       // LAN_X_BC_STOPPED, LAN_X_BC_TRACK_POWER_OFF/ON,
+                                         // LAN_X_TURNOUT_INFO, LAN_X_EXT_ACCESSORY_INFO,
+                                         // LAN_X_LOCO_INFO (tras un cambio, a clientes
+                                         // distintos del que mandó el comando)
+#define BCFLAG_SYSTEMSTATE 0x00000100UL // LAN_SYSTEMSTATE_DATACHANGED como broadcast
+                                         // (definido para cuando se dispare como broadcast
+                                         // de verdad; hoy solo se usa como respuesta directa)
+//
+// LIMITACIÓN CONOCIDA (no resuelta a propósito): si este ESP recicla un
+// slot de z21Clients[] por LRU (tabla llena) para un cliente físico
+// distinto, el Mega no se entera de ese reciclaje y seguiría aplicando
+// clientBroadcastFlags[slot] del cliente anterior hasta que el nuevo
+// ocupante mande su propio LAN_SET_BROADCASTFLAGS. Con
+// MAX_TRACKED_CLIENTS=16 es un caso raro en la práctica. La solución
+// completa (un frame FRAME_TYPE_CLIENT_RESET(clientId) que este ESP mande
+// al reasignar un slot) queda como siguiente paso, no implementada para
+// no ampliar el framing más de lo estrictamente necesario para este
+// cambio.
+
+// -----------------------------------------------------------------------
 // Sincronización inicial Mega<->ESP (antes de levantar el servicio Z21)
 // -----------------------------------------------------------------------
 // El Mega manda HELLO cada SYNC_HELLO_INTERVAL_MS hasta que el ESP responde
@@ -123,9 +183,9 @@
 // significativos en cada sketch.
 // -----------------------------------------------------------------------
 #define MEGA_FW_VERSION_MAJOR 0
-#define MEGA_FW_VERSION_MINOR 8
+#define MEGA_FW_VERSION_MINOR 12
 #define ESP_FW_VERSION_MAJOR 0
-#define ESP_FW_VERSION_MINOR 16
+#define ESP_FW_VERSION_MINOR 17
 
 // Payload del heartbeat (17 bytes, todo little-endian):
 //   uptimeMs (4) | cycleAvgUs (4) | cycleMaxUs (2) | freeRam (2) |
@@ -361,5 +421,42 @@
 //     El cuello de botella real para muchos clientes activos a la vez
 //     sigue siendo el enlace serie unico hacia el Mega, no ninguno de
 //     estos numeros -- documentado junto a CLIENT_REPLY_QUEUE_LEN.
+//   - v0.20 (2026-08-05): ESP_FW_VERSION_MINOR 16->17, MEGA_FW_VERSION_MINOR
+//     11->12 (corregido de paso: esta copia se habia quedado con un 8
+//     desactualizado). CAMBIO DE FORMATO DEL PAYLOAD DE FRAME_TYPE_Z21 (no
+//     de la capa de framing [SYNC][TYPE][LEN][...][CHK], que no se toca):
+//     ahora lleva 1 byte de CLIENT_ID delante del datagrama Z21 real.
+//     Nuevas constantes Z21_MAX_CLIENTS, CLIENT_ID_NONE, BCFLAG_BASIC,
+//     BCFLAG_SYSTEMSTATE (ver comentario grande junto a ellas, mas
+//     arriba). ESTO SUSTITUYE la cola FIFO (replyQueue/PendingReply,
+//     CLIENT_REPLY_QUEUE_LEN) descrita en v0.18/v0.19 arriba -- ya no
+//     hace falta y se ha quitado del .ino: en vez de adivinar el
+//     destinatario por orden de llegada, cada UDP entrante se etiqueta
+//     con su slot real de z21Clients[] (trackClient() ahora devuelve el
+//     slot) antes de mandarlo al Mega, y cada frame que vuelve del Mega
+//     trae ese mismo slot para saber exactamente a que IP/puerto
+//     reenviarlo -- ya no hay heuristica de por medio, y el Mega puede
+//     mandar tantos frames como clientes distintos necesite notificar
+//     (broadcasts reales: LAN_X_BC_STOPPED, LAN_X_TURNOUT_INFO, etc, ver
+//     mega_z21.ino). ACTUALIZAR LOS DOS SKETCHES A LA VEZ: un ESP v0.20
+//     hablando con un Mega anterior a v0.14 (o viceversa) desincroniza la
+//     lectura de cada FRAME_TYPE_Z21 en un byte. No afecta a HELLO/
+//     NET_INFO/SYNC_ACK/HEARTBEAT.
+//     LIMITACION CONOCIDA (no resuelta a proposito): si trackClient()
+//     reasigna un slot por LRU (tabla llena) para un cliente fisico
+//     distinto justo mientras ese slot tenia una peticion en vuelo hacia
+//     el Mega, la respuesta llegaria dirigida al cliente NUEVO que ocupa
+//     ahora el slot. Raro con MAX_TRACKED_CLIENTS=16 en la practica; la
+//     solucion completa (frame FRAME_TYPE_CLIENT_RESET) queda como
+//     siguiente paso, no implementada para no ampliar el framing mas de
+//     lo necesario para este cambio.
+//     NOTA IMPORTANTE (por como se descubrio el bug de compilacion que
+//     motivo este apunte): la copia de este header en src/shared/ se
+//     habia quedado desactualizada respecto a esta copia real (le
+//     faltaban varias entradas de historial y estas constantes de
+//     multi-red WiFi/OTA/etc ya llevaban tiempo solo aqui) -- si se
+//     vuelve a usar src/shared/ como plantilla para regenerar las copias
+//     de los sketches, verificar primero con un diff contra las copias
+//     reales que compilan, no al reves.
 
 #endif // Z21_PROTOCOL_H
