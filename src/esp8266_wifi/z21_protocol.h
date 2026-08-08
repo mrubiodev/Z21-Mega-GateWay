@@ -32,6 +32,35 @@
 #define LAN_X_GET_STATUS 0x40  // dentro de LAN_X, canal X-Bus
 #define LAN_GET_CODE 0x18
 
+#define LAN_GET_COMMUNICATION_INFO 0x12
+
+#define LAN_CAN_DETECTOR 0xC4
+
+// Accesorios (agujas/señales de 2 aspectos/desacopladores/descarriladores
+// biestables) — PDF oficial sección 5 "Switching". Mismo XHeader 0x43
+// para la petición (5.1) y la respuesta (5.3): se distinguen por
+// DataLen/DB2, no por el XHeader.
+#define LAN_X_GET_TURNOUT_INFO 0x43
+#define LAN_X_TURNOUT_INFO 0x43
+#define LAN_X_SET_TURNOUT 0x53
+
+// Accesorios EXTENDIDOS (señales de más de 2 aspectos, decodificadores
+// DCCext según RCN-213) — PDF oficial secciones 5.4-5.6. Direccionamiento
+// DISTINTO al de LAN_X_(GET_)TURNOUT(_INFO) de arriba: aquí la dirección
+// es la RawAddress de RCN-213 tal cual (primer decodificador extendido =
+// RawAddress 4, mostrado como "dirección 1" en las UIs), sin la
+// conversión a puerto/salida que sí aplica la sección 5 a los turnouts
+// normales — ver ExtAccessoryState en traction_types.h. Igual que pasa
+// con 0x43 arriba, el XHeader 0x44 se reutiliza para la petición (5.5) y
+// la respuesta (5.6): se distinguen por DataLen, no por el XHeader.
+#define LAN_X_SET_EXT_ACCESSORY 0x54
+#define LAN_X_GET_EXT_ACCESSORY_INFO 0x44
+#define LAN_X_EXT_ACCESSORY_INFO 0x44
+
+// Byte "Status" de LAN_X_EXT_ACCESSORY_INFO (PDF sección 5.6, DB3)
+#define EXT_ACCESSORY_STATUS_VALID 0x00
+#define EXT_ACCESSORY_STATUS_UNKNOWN 0xFF
+
 // Headers de la secuencia de conexión/login (PDF oficial, secciones
 // 2.16-2.19). IMPORTANTE: el propio PDF dice literalmente que "el login
 // se hace de forma implícita con el primer comando del cliente (p.ej.
@@ -53,11 +82,22 @@
 
 // SystemState.Capabilities (PDF oficial sección 2.18, byte 15, definido
 // desde Z21 FW V1.42). Solo se listan los bits que realmente podemos
-// declarar con honestidad en esta versión dummy (DCC + comandos de
-// tracción por LAN); el resto (MM, RailCom, accesorios, detectores) NO se
-// marca porque no hay backend real para ellos todavía.
+// declarar con honestidad; el resto (MM, RailCom, detectores) NO se marca
+// porque no hay backend real para ellos todavía.
+// CAP_ACCESSORY_CMDS añadido junto con el soporte de LAN_X_(GET/SET)_
+// TURNOUT (agujas/señales de 2 aspectos) y LAN_X_(GET/SET)_EXT_ACCESSORY
+// (señales de más de 2 aspectos) — ambos aceptan y responden comandos LAN
+// de accesorios de forma coherente aunque, con backend XpressNet, los
+// extendidos todavía no lleguen de verdad al bus físico (ver limitación
+// documentada en traction_backend_xpressnet.h). El bit describe lo que
+// acepta el LAN de esta central, no si hay hardware detrás confirmando
+// cada comando — igual que CAP_LOCO_CMDS tampoco implica que haya una vía
+// con corriente real conectada. El ESP no interpreta este byte (solo lo
+// transporta dentro del datagrama Z21), pero la constante vive aquí para
+// que las 3 copias del header describan el mismo protocolo completo.
 #define CAP_DCC 0x01
 #define CAP_LOCO_CMDS 0x10
+#define CAP_ACCESSORY_CMDS 0x20
 
 // -----------------------------------------------------------------------
 // Framing interno ESP<->Mega:
@@ -458,5 +498,27 @@
 //     vuelve a usar src/shared/ como plantilla para regenerar las copias
 //     de los sketches, verificar primero con un diff contra las copias
 //     reales que compilan, no al reves.
+
+//   - v0.21 (2026-08-06): Sin cambio de MEGA_FW_VERSION_MINOR/ESP_FW_VERSION_MINOR
+//     (no hay cambio de comportamiento, solo de constantes documentadas).
+//     Esta copia (src/esp8266_wifi/) se habia quedado desincronizada de
+//     src/shared/ y src/mega_z21/protocol/ (que si coincidian entre si):
+//     le faltaban LAN_GET_COMMUNICATION_INFO, LAN_CAN_DETECTOR, el bloque
+//     completo de accesorios (LAN_X_(GET_)TURNOUT_INFO/SET_TURNOUT,
+//     LAN_X_SET_EXT_ACCESSORY/GET_EXT_ACCESSORY_INFO/EXT_ACCESSORY_INFO,
+//     EXT_ACCESSORY_STATUS_*) y CAP_ACCESSORY_CMDS -- introducidas en el
+//     lado Mega en v0.11/v0.12 (ver arriba) y nunca replicadas aqui. No
+//     rompia la compilacion ni el comportamiento porque este sketch no
+//     interpreta el payload Z21 ("el ESP solo transporta", ver AGENT.md;
+//     su sniffer decodifica por XHeader crudo, sin necesitar una entrada
+//     por comando) -- pero mantenia esta copia incompleta como referencia
+//     y contradecia la politica de las "3 copias identicas" que este mismo
+//     historial pide seguir. Corregido anadiendo el bloque tal cual esta
+//     en src/shared/. Detectado durante una revision cruzada con el
+//     proyecto cliente (z21-throttle, ver su docs/05-convenciones-
+//     compartidas-con-servidor.md), no por un fallo de compilacion como
+//     las dos veces anteriores que este historial documenta (v0.14/v0.20)
+//     -- motivo de mas para automatizar esta comprobacion en vez de
+//     confiar solo en acordarse.
 
 #endif // Z21_PROTOCOL_H
