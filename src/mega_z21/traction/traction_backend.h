@@ -76,9 +76,61 @@ enum class FunctionGroup : uint8_t {
   F61toF68 = 10
 };
 
+// ---------------------------------------------------------------------
+// Notificación de cambios que vienen DEL BUS (no de un comando LAN de la
+// app Z21) — añadido para que un backend asíncrono (XpressNet) pueda
+// avisar al núcleo Z21 de que la MultiMaus, otro regulador, o la propia
+// vía (corto, parada de emergencia física) cambiaron algo, y el núcleo
+// pueda reenviarlo como broadcast a los clientes Z21 suscritos (PDF Z21
+// 2.7/2.8/2.9/2.10/2.14/4.4/5.3: TODAS estas notificaciones dicen
+// explícitamente "... or [the state] was changed by some input device
+// (multiMaus)" — antes de esto, este firmware solo emitía el broadcast
+// cuando el cambio venía de la propia app, lo cual es incompleto en
+// cuanto hay un segundo maestro real en el bus, como la MultiMaus).
+//
+// Backends síncronos (DummyTractionBackend) nunca disparan esto: su
+// estado solo cambia dentro de las propias llamadas set*() del núcleo,
+// que ya construyen su respuesta/broadcast directamente en
+// mega_z21.ino — no hay ningún "cambio externo" que avisar.
+// ---------------------------------------------------------------------
+enum class TractionEventType : uint8_t {
+  LocoChanged,       // address = dirección de loco (formato Z21, 14 bits)
+  TurnoutChanged,    // address = dirección de accesorio (16 bits, sin enmascarar)
+  TrackPowerOn,
+  TrackPowerOff,
+  EmergencyStop,     // solo se dispara al ACTIVARSE, no al terminar (ver PDF 2.14)
+  ShortCircuit,
+  ProgrammingMode,   // se entró en modo de programación CV (PDF 2.9)
+  CvResult,          // address = dirección de CV, value = valor leído/confirmado
+  CvNack             // no hubo ACK del decodificador (PDF 6.4)
+};
+
+struct TractionChangeEvent {
+  TractionEventType type;
+  uint16_t address; // sin uso para TrackPowerOn/Off/EmergencyStop/ShortCircuit/ProgrammingMode
+  uint8_t value;    // solo con significado para CvResult
+};
+
+typedef void (*TractionChangeCallback)(const TractionChangeEvent &event);
+
 class ITractionBackend {
 public:
   virtual ~ITractionBackend() {}
+
+  // Registra el callback del núcleo Z21 que se debe invocar cuando este
+  // backend detecte (de forma asíncrona, dentro de poll()) un cambio que
+  // vino del bus. Implementación por defecto no-op: los backends sin bus
+  // real (dummy) nunca la necesitan y no tienen que sobreescribirla.
+  virtual void setChangeCallback(TractionChangeCallback cb) { (void)cb; }
+
+  // Programación de CVs en modo directo/servicio (LAN_X_CV_READ/WRITE,
+  // PDF sección 6). Devuelve true si el backend pudo aceptar/encolar el
+  // comando (no implica éxito todavía — eso llega después, de forma
+  // asíncrona, como TractionChangeEvent::CvResult/CvNack vía el
+  // callback de arriba). false = este backend no soporta programación de
+  // CVs en absoluto (p.ej. el dummy, sin bus real detrás).
+  virtual bool cvRead(uint16_t cvAddress) { (void)cvAddress; return false; }
+  virtual bool cvWrite(uint16_t cvAddress, uint8_t value) { (void)cvAddress; (void)value; return false; }
 
   // Inicializa el bus físico (UART, pines DE/RE, dirección propia en el
   // bus, etc.). Se llama una vez desde setup().

@@ -765,17 +765,31 @@ void connectWiFi() {
 
   if (!anySsidConfigured) {
     evLogf("[WiFi] Sin ningun SSID guardado en EEPROM -> AP directo");
+    sendWifiAttempt(WIFI_ATTEMPT_AP_FALLBACK, 0, 0, "");
     startAPFallback();
     return;
+  }
+
+  uint8_t networksConfigured = 0;
+  for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
+    if (strlen(cfgSSID[i]) > 0) networksConfigured++;
   }
 
   WiFi.mode(WIFI_STA);
   applyMac();
 
+  uint8_t attemptIndex = 0;
   for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
     if (strlen(cfgSSID[i]) == 0) continue; // slot vacio, se salta
+    attemptIndex++;
 
     evLogf("[WiFi] Probando red %d/%d: %s", i + 1, WIFI_MAX_NETWORKS, cfgSSID[i]);
+    // Se manda ANTES de WiFi.begin(), para que la pantalla del Mega
+    // muestre el SSID que se está probando desde el primer instante -- no
+    // solo cuando ya se conoce el resultado (ver petición de usuario en
+    // el historial de z21_protocol.h, "WifiAttempt"). La password NUNCA
+    // se manda al Mega -- solo vive aquí y en el portal web.
+    sendWifiAttempt(WIFI_ATTEMPT_TRYING, attemptIndex, networksConfigured, cfgSSID[i]);
     WiFi.begin(cfgSSID[i], cfgPass[i]);
 
     unsigned long start = millis();
@@ -789,14 +803,17 @@ void connectWiFi() {
       apModeSinceMs = 0; // ya no estamos en AP, se desactiva el reintento periodico
       IPAddress ip = WiFi.localIP();
       evLogf("[WiFi] Conectado a %s. IP=%d.%d.%d.%d RSSI=%d MAC=%s", cfgSSID[i], ip[0], ip[1], ip[2], ip[3], WiFi.RSSI(), WiFi.macAddress().c_str());
+      sendWifiAttempt(WIFI_ATTEMPT_CONNECTED, attemptIndex, networksConfigured, cfgSSID[i]);
       return;
     }
 
     evLogfL(LOG_LVL_WARN, "[WiFi] Timeout conectando a %s", cfgSSID[i]);
+    sendWifiAttempt(WIFI_ATTEMPT_FAILED, attemptIndex, networksConfigured, cfgSSID[i]);
     WiFi.disconnect(); // limpio antes de probar la siguiente red
   }
 
   evLogfL(LOG_LVL_WARN, "[WiFi] Ninguna de las redes guardadas disponible -> fallback a AP");
+  sendWifiAttempt(WIFI_ATTEMPT_AP_FALLBACK, 0, networksConfigured, "");
   startAPFallback();
 }
 
@@ -869,6 +886,7 @@ const char *frameTypeName(uint8_t t) {
     case FRAME_TYPE_HELLO: return "HELLO";
     case FRAME_TYPE_NET_INFO: return "NET_INFO";
     case FRAME_TYPE_SYNC_ACK: return "SYNC_ACK";
+    case FRAME_TYPE_WIFI_ATTEMPT: return "WIFI_ATTEMPT";
     default: return "?";
   }
 }
@@ -1026,6 +1044,32 @@ void sendToMega(uint8_t type, const uint8_t *payload, uint8_t len) {
   Serial.write(len);
   Serial.write(payload, len);
   Serial.write(chk);
+}
+
+// Manda FRAME_TYPE_WIFI_ATTEMPT (ver payload "WifiAttempt" en
+// z21_protocol.h). Se llama desde connectWiFi() -- SIEMPRE antes de que
+// exista sync con el Mega (el handshake HELLO/NET_INFO/SYNC_ACK todavia
+// no ha podido pasar, porque el ESP esta bloqueado aqui en su propio
+// setup()) -- pero sendToMega() no exige sync para nada, solo escribe el
+// frame por Serial, así que esto llega igualmente en cuanto el Mega esté
+// leyendo su lado del enlace.
+//
+// La password NUNCA se manda por aquí -- el Mega no debe conocerla, solo
+// el SSID/estado/intento (petición de usuario). Para ver la password
+// guardada, usar el portal web (ver htmlConfigPage()).
+void sendWifiAttempt(uint8_t state, uint8_t index, uint8_t total, const char *ssid) {
+  uint8_t ssidLen = (uint8_t)strlen(ssid);
+  if (ssidLen > WIFI_ATTEMPT_SSID_MAXLEN) ssidLen = WIFI_ATTEMPT_SSID_MAXLEN;
+
+  uint8_t payload[3 + 1 + WIFI_ATTEMPT_SSID_MAXLEN];
+  uint8_t idx = 0;
+  payload[idx++] = state;
+  payload[idx++] = index;
+  payload[idx++] = total;
+  payload[idx++] = ssidLen;
+  memcpy(&payload[idx], ssid, ssidLen);
+  idx += ssidLen;
+  sendToMega(FRAME_TYPE_WIFI_ATTEMPT, payload, idx);
 }
 
 // Máquina de estados no bloqueante: NO consume ningún byte "a ciegas"
@@ -1791,6 +1835,16 @@ void handleRoot() {
   for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
     html += "Red " + String(i + 1) + " - SSID: <input id='ssid" + String(i + 1) + "' name='ssid" + String(i + 1) + "' value='" + htmlEscape(String(cfgSSID[i])) + "'> ";
     html += "Password: <input name='pass" + String(i + 1) + "' type='password'> ";
+    // Se muestra el valor YA guardado (en claro) a un lado del campo de
+    // edición -- el campo en sí se deja siempre vacío (type='password',
+    // "dejar en blanco para no cambiarla") para no reescribir la password
+    // por accidente solo con abrir esta página. Esto es justo lo que
+    // pidió el usuario: poder VER la password configurada sin tener que
+    // conectar el monitor serie ni sacarla del Mega (que ya no la conoce,
+    // ver FRAME_TYPE_WIFI_ATTEMPT en z21_protocol.h) -- esta página ya
+    // está protegida por las credenciales de acceso del portal, así que
+    // no es una superficie de exposición nueva.
+    html += "<i>(actual: " + (strlen(cfgPass[i]) > 0 ? htmlEscape(String(cfgPass[i])) : String("- vacia -")) + ")</i> ";
     html += "<i>(dejar en blanco para no cambiarla)</i><br>";
   }
 

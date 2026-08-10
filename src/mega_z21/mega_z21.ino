@@ -136,6 +136,17 @@ uint8_t linkBuf[LINK_BUF_SIZE];
 // currentReplyClientId.
 uint8_t currentReplyClientId = CLIENT_ID_NONE;
 
+// Cliente que inició la última LAN_X_CV_READ/WRITE en curso (PDF 6.4/6.5:
+// LAN_X_CV_NACK/LAN_X_CV_RESULT se mandan "al cliente que inició la
+// programación", como respuesta directa, no como broadcast). Solo puede
+// haber una programación de CV en curso a la vez (mismo límite que
+// cvPending_ dentro del backend XpressNet, que además ahora RECHAZA
+// explícitamente una segunda petición mientras la primera sigue
+// pendiente — ver cvRead()/cvWrite() en traction_backend_xpressnet.cpp —
+// para no sobreescribir este valor y dejar al primer cliente huérfano,
+// sin NACK y sin resultado).
+uint8_t pendingCvClientId = CLIENT_ID_NONE;
+
 // Flags de LAN_SET_BROADCASTFLAGS, uno por slot de cliente (mismo índice
 // que z21Clients[] en el ESP — ver AGENT.md, "el ESP no debe interpretar
 // contenido Z21": el Mega es quien decide a quién le interesa cada
@@ -467,6 +478,52 @@ void handleNetInfo(const uint8_t *payload, uint8_t len) {
               (netInfoGateway >> 16) & 0xFF, (netInfoGateway >> 24) & 0xFF, macStr);
 }
 
+// Ver z21_protocol.h, payload "WifiAttempt" (FRAME_TYPE_WIFI_ATTEMPT).
+// A diferencia de handleNetInfo() (que solo llega UNA vez resuelta la
+// conexión y completado el handshake), este frame puede llegar mientras
+// !synced -- de hecho es lo normal, ver el historial de z21_protocol.h --
+// así que no depende para nada de `synced`. Vuelca el intento en el log
+// de comunicación de la pantalla: SSID, estado e intento (N/total), NO la
+// password -- el Mega nunca la recibe, por diseño (petición de usuario);
+// para verla, el portal web del ESP la muestra (ver htmlConfigPage() en
+// esp8266_wifi.ino). No se añade una fila nueva a la cabecera de estado
+// (ya sin hueco libre, ver display_status_panel.cpp) -- el log es donde
+// ya vivían el resto de datos de red que no caben ahí (SSID, gateway).
+void handleWifiAttempt(const uint8_t *payload, uint8_t len) {
+  if (len < 4) return; // frame corrupto/corto, se ignora (igual que handleNetInfo)
+
+  uint8_t state = payload[0];
+  uint8_t index = payload[1];
+  uint8_t total = payload[2];
+
+  const uint8_t ssidLenOffset = 3;
+  uint8_t ssidLen = payload[ssidLenOffset];
+  if (ssidLen > WIFI_ATTEMPT_SSID_MAXLEN) ssidLen = WIFI_ATTEMPT_SSID_MAXLEN;
+  uint8_t ssidOffset = ssidLenOffset + 1;
+  if ((uint16_t)(ssidOffset + ssidLen) > len) ssidLen = (len > ssidOffset) ? (len - ssidOffset) : 0;
+
+  char ssid[WIFI_ATTEMPT_SSID_MAXLEN + 1];
+  for (uint8_t i = 0; i < ssidLen; i++) ssid[i] = (char)payload[ssidOffset + i];
+  ssid[ssidLen] = '\0';
+
+  switch (state) {
+    case WIFI_ATTEMPT_TRYING:
+      displayLogf("WiFi %u/%u: probando %s", (unsigned)index, (unsigned)total, ssid);
+      break;
+    case WIFI_ATTEMPT_CONNECTED:
+      displayLogf("WiFi %u/%u: CONECTADO a %s", (unsigned)index, (unsigned)total, ssid);
+      break;
+    case WIFI_ATTEMPT_FAILED:
+      displayLogf("WiFi %u/%u: FALLO con %s", (unsigned)index, (unsigned)total, ssid);
+      break;
+    case WIFI_ATTEMPT_AP_FALLBACK:
+      displayLogF(F("WiFi: sin redes disponibles, modo AP"));
+      break;
+    default:
+      break; // estado desconocido: se ignora, igual que un FRAME_TYPE no reconocido
+  }
+}
+
 // Se llama en cada vuelta de loop() mientras !synced. No bloquea nunca:
 // si el ESP tarda o no contesta, a los SYNC_TIMEOUT_MS seguimos igual.
 void runSyncStep() {
@@ -606,19 +663,44 @@ uint8_t buildCentralStateByte() {
 // CS_*); usa el mismo buildCentralStateByte() (estado real del backend
 // de tracción activo) que declara handleXGetStatus() (X-Header 0x62/
 // 0x22), para que ambas respuestas sean coherentes entre sí.
-void handleSystemStateGetData() {
-  uint8_t data[16];
+void buildSystemStateData(uint8_t data[16]) {
+  int16_t temperature;
+  uint16_t supplyMv;
+  uint16_t mainCurrentMa;
 
-  uint16_t jitterSlow = (uint16_t)((millis() / 3000) % 5); // 0..4, cambia cada 3s
-  int16_t temperature = 24 + (int16_t)jitterSlow;          // 24..28 °C
-  uint16_t supplyMv = 18000 + (jitterSlow * 20);          // 18000..18080 mV, para que la app vea vía activa
-
-  uint16_t mainCurrentMa = 0;
+#if TRACTION_BACKEND_SELECTED == TRACTION_BACKEND_DUMMY
+  // Backend dummy: sin bus real detrás, así que no hay NINGÚN sensor de
+  // corriente/voltaje/temperatura que leer. Se simula un pequeño jitter
+  // "para que la app vea vía activa" y así poder probar la UI sin
+  // hardware — ESTO ES A PROPÓSITO SOLO AQUÍ, ver el comentario de abajo
+  // para el motivo de por qué NO se hace lo mismo con el backend real.
   TrackState ts = traction.getTrackState();
+  uint16_t jitterSlow = (uint16_t)((millis() / 3000) % 5); // 0..4, cambia cada 3s
+  temperature = 24 + (int16_t)jitterSlow;                  // 24..28 °C
+  supplyMv = 18000 + (jitterSlow * 20);                     // 18000..18080 mV
+  mainCurrentMa = 0;
   if (ts.powerOn && !ts.emergencyStop) {
     uint16_t jitterFast = (uint16_t)((millis() / 500) % 30);
     mainCurrentMa = 300 + jitterFast;
   }
+#else
+  // Backend XpressNet real: este Mega es un ESCLAVO en el bus (ver
+  // traction_backend_xpressnet.h) — la corriente/voltaje/temperatura de
+  // verdad las mide el booster de la MultiMaus, no nosotros, y la
+  // librería Digital-MoBa/XpressNet (rol slave) no expone esos valores
+  // en ningún callback. Antes de este fix se rellenaban con el mismo
+  // jitter simulado que el backend dummy, lo cual es ENGAÑOSO en cuanto
+  // hay hardware real de por medio (la app mostraría una corriente que
+  // no tiene nada que ver con lo que de verdad pasa en la vía — podría
+  // ocultar un problema real o alarmar sin motivo). Se manda 0 con
+  // honestidad hasta que exista algún sensor propio en este Mega (p.ej.
+  // un ACS712 en la salida) que sí pueda leerse de verdad. buildCentral
+  // StateByte() de abajo ya consulta traction.getTrackState() por su
+  // cuenta, así que no hace falta duplicar la llamada aquí.
+  temperature = 0;
+  supplyMv = 0;
+  mainCurrentMa = 0;
+#endif
 
   data[0] = mainCurrentMa & 0xFF; data[1] = (mainCurrentMa >> 8) & 0xFF;
   data[2] = 0x00; data[3] = 0x00;
@@ -630,7 +712,26 @@ void handleSystemStateGetData() {
   data[13] = 0x00;
   data[14] = 0x00;
   data[15] = CAP_DCC | CAP_LOCO_CMDS | CAP_ACCESSORY_CMDS;
+}
+
+void handleSystemStateGetData() {
+  uint8_t data[16];
+  buildSystemStateData(data);
   sendDataset(LAN_SYSTEMSTATE_DATACHANGED, data, 16);
+}
+
+// PDF 2.18: "se reporta de forma asíncrona ... cuando el cliente activó
+// el broadcast correspondiente (flag 0x00000100)". Antes de este fix
+// NUNCA se mandaba nada por este flag salvo como respuesta directa a
+// LAN_SYSTEMSTATE_GETDATA — un cliente suscrito solo con BCFLAG_
+// SYSTEMSTATE (sin BCFLAG_BASIC) se quedaba sin ninguna notificación
+// hasta que volviera a preguntar él mismo. Se llama desde
+// onTractionChange() cada vez que cambia algo relevante para
+// CentralState (power/e-stop/short/programming).
+void broadcastSystemStateChanged() {
+  uint8_t data[16];
+  buildSystemStateData(data);
+  broadcastDataset(BCFLAG_SYSTEMSTATE, CLIENT_ID_NONE, LAN_SYSTEMSTATE_DATACHANGED, data, 16);
 }
 
 void handleXGetVersion() {
@@ -687,17 +788,64 @@ void handleXGetFirmwareVersion() {
 // (ITractionBackend) — qué backend sea de verdad (dummy o XpressNet) es
 // invisible desde aquí, ver el selector al principio del sketch.
 // ---------------------------------------------------------------------
-void handleXSetTrackPowerOff() {
-  traction.setTrackPower(false);
+// ---------------------------------------------------------------------
+// Broadcasts reutilizables (PDF 2.7/2.8/2.9/2.10/2.14): factorizados en
+// funciones aparte porque a partir de ahora se disparan desde DOS sitios
+// distintos: cuando el comando lo pide la app Z21 (handleXSetTrackPower*/
+// handleXSetStop) Y cuando lo detecta el backend de tracción viniendo del
+// bus (onTractionChange() más abajo, PDF: "... or fue cambiado por algún
+// dispositivo de entrada (multiMaus)"). Antes de este refactor, un cambio
+// de estado iniciado por la MultiMaus (o un corto real) nunca llegaba a
+// los clientes Z21 conectados por WiFi — solo se notificaba cuando el
+// comando venía de la propia app.
+// ---------------------------------------------------------------------
+void broadcastTrackPowerOff() {
   uint8_t x[3] = { 0x61, 0x00, 0x00 };
   x[2] = xorChecksum(x, 2);
-  // LAN_X_BC_TRACK_POWER_OFF es un broadcast real (PDF sección 2.5), no
-  // una respuesta directa a uno solo — mismo razonamiento que
-  // handleXSetStop: se manda a todos los clientes suscritos a
-  // BCFLAG_BASIC, sin excluir a nadie (el que lo pidió también lo espera
-  // si está suscrito, igual que cualquier otro).
   broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
   displayLogF(F("Track power OFF"));
+}
+
+void broadcastTrackPowerOn() {
+  uint8_t x[3] = { 0x61, 0x01, 0x00 };
+  x[2] = xorChecksum(x, 2);
+  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
+  displayLogF(F("Track power ON"));
+}
+
+void broadcastStopped() {
+  uint8_t x[3] = { 0x81, 0x00, 0x00 };
+  x[2] = xorChecksum(x, 2);
+  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
+  displayLogF(F("*** PARADA DE EMERGENCIA ***"));
+}
+
+// LAN_X_BC_TRACK_SHORT_CIRCUIT (PDF 2.10) — X-Header 0x61, DB0 0x08. NO
+// existía ningún 'case' ni ninguna llamada a esto en todo el sketch: un
+// cortocircuito real en la vía se reflejaba en buildCentralStateByte()
+// (así que LAN_X_GET_STATUS/SYSTEMSTATE lo mostrarían si se preguntaba),
+// pero nunca se avisaba de forma proactiva a los clientes suscritos.
+void broadcastTrackShortCircuit() {
+  uint8_t x[3] = { 0x61, 0x08, 0x00 };
+  x[2] = xorChecksum(x, 2);
+  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
+  displayLogF(F("*** CORTOCIRCUITO ***"));
+}
+
+// LAN_X_BC_PROGRAMMING_MODE (PDF 2.9) — X-Header 0x61, DB0 0x02. Tampoco
+// existía: se manda cuando se entra en modo de programación de CVs,
+// disparado tanto por nuestras propias LAN_X_CV_READ/WRITE (más abajo)
+// como por si la MultiMaus entra en Service Mode por su cuenta.
+void broadcastProgrammingMode() {
+  uint8_t x[3] = { 0x61, 0x02, 0x00 };
+  x[2] = xorChecksum(x, 2);
+  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
+  displayLogF(F("Modo de programacion CV activo"));
+}
+
+void handleXSetTrackPowerOff() {
+  traction.setTrackPower(false);
+  broadcastTrackPowerOff();
 }
 
 void handleXSetTrackPowerOn() {
@@ -707,11 +855,89 @@ void handleXSetTrackPowerOn() {
   // replica esa misma regla (ver traction_backend_dummy.h /
   // traction_backend_xpressnet.cpp).
   traction.setTrackPower(true);
-  uint8_t x[3] = { 0x61, 0x01, 0x00 };
+  broadcastTrackPowerOn();
+}
+
+// LAN_X_CV_RESULT / LAN_X_CV_NACK (PDF 6.4/6.5): a diferencia de los
+// broadcasts de arriba, esto es una respuesta DIRECTA al cliente que
+// inició la programación (pendingCvClientId, fijado en el 'case' de
+// LAN_X_CV_READ/WRITE del dispatcher) — el PDF es explícito: "is
+// automatically sent to the client that initiated the programming".
+void sendCvResult(uint16_t cvAddress, uint8_t value) {
+  if (pendingCvClientId == CLIENT_ID_NONE) return;
+  uint8_t x[6] = { 0x64, 0x14, (uint8_t)((cvAddress >> 8) & 0xFF), (uint8_t)(cvAddress & 0xFF), value, 0x00 };
+  x[5] = xorChecksum(x, 5);
+  sendDatasetToClient(pendingCvClientId, 0x40, x, 6);
+  pendingCvClientId = CLIENT_ID_NONE;
+}
+
+void sendCvNack() {
+  if (pendingCvClientId == CLIENT_ID_NONE) return;
+  uint8_t x[3] = { 0x61, 0x13, 0x00 };
   x[2] = xorChecksum(x, 2);
-  // LAN_X_BC_TRACK_POWER_ON: broadcast real, mismo razonamiento que arriba.
-  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
-  displayLogF(F("Track power ON"));
+  sendDatasetToClient(pendingCvClientId, 0x40, x, 3);
+  pendingCvClientId = CLIENT_ID_NONE;
+}
+
+// Único punto de entrada de TODOS los cambios que un backend asíncrono
+// (XpressNet) detecta viniendo del bus físico — registrado en setup()
+// vía traction.setChangeCallback(). Ver TractionChangeEvent en
+// traction_backend.h para el porqué de este mecanismo: antes de que
+// existiera, ningún cambio iniciado por la MultiMaus (u otro cliente
+// XpressNet) llegaba nunca a los clientes Z21 conectados por WiFi.
+void onTractionChange(const TractionChangeEvent &ev) {
+  switch (ev.type) {
+    case TractionEventType::LocoChanged: {
+      const LocoState *loco = traction.getLocoState(ev.address);
+      if (loco != nullptr) {
+        uint8_t adrMsbRaw = (uint8_t)((ev.address >> 8) & 0x3F);
+        uint8_t adrLsb = (uint8_t)(ev.address & 0xFF);
+        // CLIENT_ID_NONE: no excluye a nadie. Si este cambio es la
+        // confirmación (por el bus) de un LAN_X_SET_LOCO_DRIVE que
+        // mandó justo la app, esta es la corrección al estado
+        // "todavía viejo" que ya se le había respondido de inmediato
+        // (ver handleXSetLocoDriveOrFunction) — mientras que si viene
+        // de la MultiMaus, es la ÚNICA notificación que recibirá.
+        broadcastLocoInfo(adrMsbRaw, adrLsb, loco, CLIENT_ID_NONE);
+      }
+      break;
+    }
+    case TractionEventType::TurnoutChanged: {
+      const AccessoryState *acc = traction.getTurnoutState(ev.address);
+      if (acc != nullptr) {
+        uint8_t adrMsb = (uint8_t)((ev.address >> 8) & 0xFF);
+        uint8_t adrLsb = (uint8_t)(ev.address & 0xFF);
+        broadcastTurnoutInfo(adrMsb, adrLsb, acc, CLIENT_ID_NONE);
+      }
+      break;
+    }
+    case TractionEventType::TrackPowerOn:
+      broadcastTrackPowerOn();
+      broadcastSystemStateChanged();
+      break;
+    case TractionEventType::TrackPowerOff:
+      broadcastTrackPowerOff();
+      broadcastSystemStateChanged();
+      break;
+    case TractionEventType::EmergencyStop:
+      broadcastStopped();
+      broadcastSystemStateChanged();
+      break;
+    case TractionEventType::ShortCircuit:
+      broadcastTrackShortCircuit();
+      broadcastSystemStateChanged();
+      break;
+    case TractionEventType::ProgrammingMode:
+      broadcastProgrammingMode();
+      broadcastSystemStateChanged();
+      break;
+    case TractionEventType::CvResult:
+      sendCvResult(ev.address, ev.value);
+      break;
+    case TractionEventType::CvNack:
+      sendCvNack();
+      break;
+  }
 }
 
 uint8_t buildLocoInfoXData(uint8_t x[11], uint8_t adrMsbRaw, uint8_t adrLsb, const LocoState *loco) {
@@ -1044,20 +1270,53 @@ void handleXSetExtAccessory(const uint8_t *data, uint8_t dataLen) {
   broadcastExtAccessoryInfo(data[1], data[2], ext, currentReplyClientId);
 }
 
+// LAN_X_CV_READ / LAN_X_CV_WRITE (PDF sección 6.1/6.2) — a diferencia de
+// otros pares get/set de este protocolo, NO comparten X-Header: READ es
+// 0x23/DB0=0x11, WRITE es 0x24/DB0=0x12 (ver los dos 'case' en el
+// dispatcher). Antes de este fix no existía NINGÚN 'case' para ninguno de
+// los dos: la app se quedaba sin respuesta si intentaba programar un CV
+// (caía silenciosamente en el 'default'). El resultado real (LAN_X_CV_
+// RESULT/NACK) llega más tarde, de forma asíncrona, vía TractionEventType
+// ::CvResult/CvNack -> onTractionChange() -> sendCvResult()/sendCvNack().
+//
+// OJO — orden importa aquí: pendingCvClientId se fija ANTES de llamar a
+// traction.cvRead()/cvWrite(), no después. Se confirmó (leyendo el código
+// fuente real de Digital-MoBa/XpressNet, no solo su cabecera) que
+// writeCVMode() dispara notifyCVResult() de forma SÍNCRONA, dentro de la
+// misma llamada, sin esperar ninguna confirmación real del bus (ver punto
+// 7b de "ASUNCIONES A VALIDAR" en traction_backend_xpressnet.h, ya
+// actualizado). Si pendingCvClientId se fijara después de la llamada,
+// como en una versión anterior de este código, el resultado de un WRITE
+// llegaría y se descartaría en silencio (sendCvResult() lo ignora si
+// pendingCvClientId sigue siendo CLIENT_ID_NONE) antes de que hubiera
+// nada que decir a quién mandárselo.
+void handleXCvReadWrite(const uint8_t *data, uint8_t dataLen) {
+  bool isRead = (dataLen >= 4 && data[0] == 0x23 && data[1] == 0x11);
+  bool isWrite = (dataLen >= 5 && data[0] == 0x24 && data[1] == 0x12);
+  if (!isRead && !isWrite) return; // p.ej. LAN_X_MM_WRITE_BYTE (mismo XHeader 0x24, DB0=0xFF) — no implementado
+  uint16_t cvAddress = ((uint16_t)data[2] << 8) | data[3]; // PDF: CV Address = (CVAdr_MSB<<8)+CVAdr_LSB, 0=CV1
+  pendingCvClientId = currentReplyClientId; // ANTES de la llamada, ver comentario de arriba
+  bool accepted = isRead ? traction.cvRead(cvAddress) : traction.cvWrite(cvAddress, data[4]);
+  if (accepted) {
+    displayLogf("CV %u: %s...", (unsigned)(cvAddress + 1), isRead ? "leyendo" : "escribiendo");
+  } else {
+    // Backend sin soporte de CVs (dummy), CV fuera de rango para la
+    // librería XpressNet (>255, ver traction_backend_xpressnet.h), o ya
+    // hay otra programación de CV en curso (ver cvPending_ en el backend
+    // XpressNet) — se avisa con NACK inmediato en vez de dejar a la app
+    // esperando algo que nunca va a llegar. pendingCvClientId se limpia
+    // aquí mismo (no hubo ninguna petición real en curso que pueda
+    // "robarle" la respuesta a nadie).
+    pendingCvClientId = CLIENT_ID_NONE;
+    uint8_t x[3] = { 0x61, 0x13, 0x00 };
+    x[2] = xorChecksum(x, 2);
+    sendXDataset(x, 3);
+  }
+}
+
 void handleXSetStop() {
   traction.emergencyStopAll();
-  uint8_t x[3] = { 0x81, 0x00, 0x00 };
-  x[2] = xorChecksum(x, 2);
-  // LAN_X_BC_STOPPED es un broadcast real (PDF 2.13): a TODOS los
-  // clientes suscritos a BCFLAG_BASIC, no una respuesta directa a uno
-  // solo. No se excluye a nadie (CLIENT_ID_NONE como excludeClientId): si
-  // esto viene de un LAN_X_SET_STOP por red, el propio cliente que lo
-  // mandó también quiere/espera la confirmación si está suscrito, igual
-  // que cualquier otro; si viene del botón físico de e-stop,
-  // currentReplyClientId ya es CLIENT_ID_NONE (ver loop()) y no hay
-  // "quien lo pidió" que excluir en absoluto.
-  broadcastXDataset(BCFLAG_BASIC, CLIENT_ID_NONE, x, 3);
-  displayLogF(F("*** PARADA DE EMERGENCIA ***"));
+  broadcastStopped();
 }
 
 void handleCanDetector(const uint8_t *data, uint8_t dataLen) {
@@ -1356,6 +1615,18 @@ void handleDataset(const uint8_t *payload, uint8_t len) {
         case 0x54: // LAN_X_SET_EXT_ACCESSORY (PDF sección 5.4)
           handleXSetExtAccessory(data, dataLen);
           break;
+        case 0x23: // LAN_X_CV_READ (DB0=0x11), PDF sección 6.1
+          handleXCvReadWrite(data, dataLen);
+          break;
+        case 0x24: // LAN_X_CV_WRITE (DB0=0x12), PDF sección 6.2 — X-Header
+                    // DISTINTO de LAN_X_CV_READ (verificado contra el PDF:
+                    // a diferencia de otros pares get/set de este mismo
+                    // protocolo, READ y WRITE NO comparten X-Header). Este
+                    // mismo 0x24 también lo usa LAN_X_MM_WRITE_BYTE
+                    // (DB0=0xFF, PDF 6.12) — no implementado, se ignora
+                    // dentro de handleXCvReadWrite() si DB0 no es 0x12.
+          handleXCvReadWrite(data, dataLen);
+          break;
         case 0x80:
           // Verificado contra el PDF (sección 2.13): LAN_X_SET_STOP tiene
           // XHeader 0x80 y NO lleva DB0 (solo XHeader+XOR, DataLen 0x06).
@@ -1421,6 +1692,11 @@ void setup() {
   // El backend XpressNet inicializa aquí dentro su propio Serial1 (RS485)
   // vía la librería externa — el dummy no toca ningún puerto físico.
   traction.begin();
+  // Registra el callback de "cambios que vienen del bus" (ver
+  // TractionChangeEvent en traction_backend.h y onTractionChange() más
+  // abajo) — no-op para el backend dummy (nunca lo invoca, ver su
+  // implementación por defecto en ITractionBackend).
+  traction.setChangeCallback(onTractionChange);
 #if TRACTION_BACKEND_SELECTED == TRACTION_BACKEND_XPRESSNET
   displayLogF(F("Backend traccion: XpressNet"));
 #else
@@ -1527,6 +1803,13 @@ void loop() {
         // Puede llegar más de una vez (p.ej. el ESP se reconecta a otra
         // red); siempre la tramitamos, no solo la primera.
         handleNetInfo(linkBuf, len);
+        break;
+
+      case FRAME_TYPE_WIFI_ATTEMPT:
+        // Puede llegar varias veces por arranque (una por cada red
+        // guardada que se prueba, más el resultado final) e incluso antes
+        // de completar el handshake de sync -- ver handleWifiAttempt().
+        handleWifiAttempt(linkBuf, len);
         break;
 
       case FRAME_TYPE_Z21:

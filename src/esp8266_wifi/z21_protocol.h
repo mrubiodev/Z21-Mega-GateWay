@@ -122,6 +122,14 @@
 //   FRAME_TYPE_NET_INFO  ESP->Mega, info de red (ver NetInfo más abajo)
 //   FRAME_TYPE_SYNC_ACK  Mega->ESP, "info de red recibida, ya puedes
 //                        levantar el servicio Z21 (UDP)"
+//   FRAME_TYPE_WIFI_ATTEMPT ESP->Mega, progreso/resultado de un intento
+//                        de conexión STA (ver WifiAttempt más abajo) —
+//                        pensado para la pantalla del Mega: poder ver en
+//                        vivo a qué red se está probando a conectar
+//                        (SSID y password tal cual están guardados en el
+//                        ESP, para verificar visualmente que son
+//                        correctos) y si el intento acabó en éxito,
+//                        fallo, o fallback a modo AP.
 // Ver AGENT.md, sección "Diagnóstico" y "Sincronización inicial".
 // -----------------------------------------------------------------------
 #define LINK_SYNC_BYTE_0 0xAA
@@ -132,6 +140,7 @@
 #define FRAME_TYPE_HELLO 0x03
 #define FRAME_TYPE_NET_INFO 0x04
 #define FRAME_TYPE_SYNC_ACK 0x05
+#define FRAME_TYPE_WIFI_ATTEMPT 0x06
 
 // -----------------------------------------------------------------------
 // Client-id en el payload de FRAME_TYPE_Z21 (v0.20, soporte multi-cliente
@@ -216,6 +225,29 @@
 #define NET_INFO_MAC_LEN 6
 #define NET_INFO_SSID_MAXLEN 32
 
+// WifiAttempt payload (todo lo manda el ESP en FRAME_TYPE_WIFI_ATTEMPT),
+// desde v0.15/v0.22 (payload recortado en v0.16/v0.23, ver "Historial" de
+// cada copia — el Mega NO debe conocer nunca la password, solo el ESP la
+// guarda). A diferencia de NetInfo (que solo se manda una vez resuelta la
+// conexión, tras el handshake HELLO/SYNC_ACK), este frame se manda
+// DURANTE connectWiFi() según va probando cada red guardada -- por eso NO
+// depende de que el Mega ya haya completado el handshake de
+// sincronización: sendToMega()/tryReadFrameFromESP() funcionan a nivel de
+// framing puro, sin exigir "synced". Petición de usuario: poder ver en la
+// pantalla del Mega, mientras se está intentando conectar, el SSID y el
+// resultado de la conexión -- la password NUNCA sale de aquí por este
+// frame; para verla, el propio portal web (ver htmlConfigPage() más
+// abajo) muestra el valor actualmente guardado de cada red.
+//   state(1) | index(1) | total(1) | ssidLen(1) | ssid(ssidLen)
+// index/total: posición (1-based) y número de redes guardadas que se
+// están probando en este ciclo de connectWiFi() (0/0 si no aplica, p.ej.
+// AP_FALLBACK sin ninguna red guardada).
+#define WIFI_ATTEMPT_TRYING 0x00      // probando esta red, resultado aún no se conoce
+#define WIFI_ATTEMPT_CONNECTED 0x01   // conectado con éxito a esta red
+#define WIFI_ATTEMPT_FAILED 0x02      // timeout/fallo con esta red, se pasa a la siguiente
+#define WIFI_ATTEMPT_AP_FALLBACK 0x03 // ninguna red guardada disponible, cae a modo AP propio
+#define WIFI_ATTEMPT_SSID_MAXLEN 32   // igual que NET_INFO_SSID_MAXLEN
+
 // -----------------------------------------------------------------------
 // Versionado interno del proyecto (NO es la versión que se declara a la
 // app Z21 en LAN_GET_HWINFO — esto es solo para nosotros, para saber qué
@@ -223,9 +255,9 @@
 // significativos en cada sketch.
 // -----------------------------------------------------------------------
 #define MEGA_FW_VERSION_MAJOR 0
-#define MEGA_FW_VERSION_MINOR 12
+#define MEGA_FW_VERSION_MINOR 14
 #define ESP_FW_VERSION_MAJOR 0
-#define ESP_FW_VERSION_MINOR 17
+#define ESP_FW_VERSION_MINOR 19
 
 // Payload del heartbeat (17 bytes, todo little-endian):
 //   uptimeMs (4) | cycleAvgUs (4) | cycleMaxUs (2) | freeRam (2) |
@@ -520,5 +552,40 @@
 //     las dos veces anteriores que este historial documenta (v0.14/v0.20)
 //     -- motivo de mas para automatizar esta comprobacion en vez de
 //     confiar solo en acordarse.
+//   - v0.22 (2026-08-09): MEGA_FW_VERSION_MINOR 12->13, ESP_FW_VERSION_MINOR
+//     17->18. Nuevo FRAME_TYPE_WIFI_ATTEMPT (ver comentario junto a la
+//     constante) y su payload WifiAttempt (ver junto a NetInfo, más
+//     arriba): connectWiFi() ahora avisa al Mega en vivo, mientras va
+//     probando cada red guardada, del SSID y la password configurados y
+//     del resultado (probando/conectado/fallo/fallback a AP) -- petición
+//     de usuario, para poder verificar visualmente en la pantalla si las
+//     credenciales guardadas son correctas sin depender del portal web ni
+//     del monitor serie (recordar que con el DIP en modo MCU<->ESP el
+//     Serial de este chip está reservado para el enlace con el Mega, ver
+//     nota de cabecera de esp8266_wifi.ino). Se manda un frame por cada
+//     red antes de probarla (state=TRYING, con password) y otro al
+//     resolverse (CONNECTED/FAILED), más uno final (AP_FALLBACK) si
+//     ninguna conecta; mega_z21.ino vuelca cada uno en su log de pantalla
+//     (handleWifiAttempt()). Al no depender de "synced" (mismo framing de
+//     sync bytes + checksum de siempre, sin más), este frame llega igual
+//     aunque el handshake HELLO/NET_INFO/SYNC_ACK todavía no se haya
+//     completado -- de hecho es el caso normal: connectWiFi() ocurre en
+//     el setup() del ESP, antes de que el Mega haya podido sincronizar.
+//     ACTUALIZAR LOS DOS SKETCHES A LA VEZ.
+//   - v0.23 (2026-08-09): MEGA_FW_VERSION_MINOR 13->14, ESP_FW_VERSION_MINOR
+//     18->19. CORRECCIÓN sobre v0.22: se retira la password del payload
+//     WifiAttempt (petición de usuario -- el Mega no debe conocer nunca la
+//     password, solo el SSID/estado/intento). Ya no existe
+//     WIFI_ATTEMPT_PASS_MAXLEN ni los campos passLen/pass del payload (ver
+//     versión recortada más arriba); sendWifiAttempt() ya no recibe el
+//     parámetro pass y handleWifiAttempt() (mega_z21.ino) deja de
+//     parsear/mostrar password. Para poder seguir verificando la password
+//     guardada (petición de usuario: "en la web si podemos ver la
+//     password"), htmlConfigPage() ahora muestra el valor actualmente
+//     guardado de cada red junto a su campo, en vez de dejarlo siempre en
+//     blanco -- la password sigue viviendo SOLO en la EEPROM de este ESP y
+//     en su portal web (ya protegido con las credenciales de acceso del
+//     propio portal), nunca cruza el enlace serie hacia el Mega.
+//     ACTUALIZAR LOS DOS SKETCHES A LA VEZ.
 
 #endif // Z21_PROTOCOL_H

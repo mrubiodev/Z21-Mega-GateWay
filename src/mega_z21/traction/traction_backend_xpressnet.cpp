@@ -63,12 +63,69 @@ void XpressNetTractionBackend::begin() {
   XpressNet.start(TRACTION_XPRESSNET_MY_ADDRESS, TRACTION_XPRESSNET_DE_RE_PIN);
 }
 
+// Cada cuánto se reintenta XpressNet.getresultCV() mientras hay una CV
+// pendiente, y cuánto se espera antes de rendirse y sintetizar un
+// LAN_X_CV_NACK (ver punto 7 de "ASUNCIONES A VALIDAR" en el .h — no hay
+// forma de confirmar estos tiempos sin hardware real, son un punto de
+// partida razonable, no un valor sagrado).
+#define CV_POLL_INTERVAL_MS 100UL
+#define CV_TIMEOUT_MS 5000UL
+
 void XpressNetTractionBackend::poll() {
   // receive() es la única función de la librería que hay que llamar en
   // cada vuelta de loop(): revisa si hay un paquete XpressNet completo y,
   // si lo hay, dispara desde dentro los callbacks notifyXXX (weak) de
   // más abajo. No bloquea si no hay nada pendiente.
   XpressNet.receive();
+
+  if (cvPending_) {
+    unsigned long now = millis();
+    if (now - lastCvPollMs_ >= CV_POLL_INTERVAL_MS) {
+      lastCvPollMs_ = now;
+      XpressNet.getresultCV(); // puede disparar notifyCVResult/notifyCVInfo desde dentro
+    }
+    if (cvPending_ && (now - cvRequestStartMs_ >= CV_TIMEOUT_MS)) {
+      cvPending_ = false;
+      if (changeCb_) changeCb_({TractionEventType::CvNack, 0, 0});
+    }
+  }
+}
+
+bool XpressNetTractionBackend::cvRead(uint16_t cvAddress) {
+  if (cvAddress > 255) return false; // ver punto 7a de "ASUNCIONES A VALIDAR" en el .h
+  if (cvPending_) return false; // ya hay otra CV en curso, ver punto 7 del .h — no hay cola
+  // cvPending_ se fija ANTES de llamar a la librería, no después: ver el
+  // comentario largo sobre writeCVMode() más abajo en cvWrite() — el
+  // mismo riesgo de orden aplica aquí por simetría/seguridad, aunque
+  // readCVMode() (a diferencia de writeCVMode()) no se ha confirmado que
+  // dispare notifyCVResult/notifyCVInfo de forma síncrona.
+  cvPending_ = true;
+  cvRequestStartMs_ = millis();
+  lastCvPollMs_ = cvRequestStartMs_;
+  XpressNet.readCVMode((byte)cvAddress);
+  return true;
+}
+
+bool XpressNetTractionBackend::cvWrite(uint16_t cvAddress, uint8_t value) {
+  if (cvAddress > 255) return false; // ver punto 7a de "ASUNCIONES A VALIDAR" en el .h
+  if (cvPending_) return false; // ya hay otra CV en curso, ver punto 7 del .h — no hay cola
+  // ORDEN CRÍTICO — confirmado leyendo el código fuente real de
+  // Digital-MoBa/XpressNet (no solo su cabecera): writeCVMode() llama a
+  // notifyCVResult() de forma SÍNCRONA, dentro de la misma llamada, SIN
+  // esperar ninguna confirmación real del bus (ni siquiera llama a
+  // getresultCV() — esa línea está comentada en el código fuente de la
+  // librería). Eso significa que onCVResult() (más abajo) puede ejecutarse
+  // y poner cvPending_=false ANTES de que writeCVMode() siquiera retorne.
+  // Si cvPending_=true se fijara DESPUÉS de la llamada (como en una
+  // versión anterior de este código), se sobreescribiría ese false recién
+  // puesto, dejando cvPending_ atascado en true PARA SIEMPRE — bloqueando
+  // toda escritura de CV futura hasta reiniciar el Mega. Ver punto 7b de
+  // "ASUNCIONES A VALIDAR" en el .h, ya actualizado con este hallazgo.
+  cvPending_ = true;
+  cvRequestStartMs_ = millis();
+  lastCvPollMs_ = cvRequestStartMs_;
+  XpressNet.writeCVMode((byte)cvAddress, value);
+  return true;
 }
 
 bool XpressNetTractionBackend::setTrackPower(bool on) {
@@ -278,10 +335,31 @@ void XpressNetTractionBackend::onXNetStatus(uint8_t ledState) {
 void XpressNetTractionBackend::onXNetPower(uint8_t state) {
   // state llega en formato csXxx (ver XpressNet.h): csTrackVoltageOff
   // tiene el bit correspondiente puesto si la vía está cortada.
+  TrackState prev = track_;
   track_.powerOn = !(state & csTrackVoltageOff);
   track_.emergencyStop = (state & csEmergencyStop) != 0;
   track_.shortCircuit = (state & csShortCircuit) != 0;
   track_.serviceModeActive = (state & csServiceMode) != 0;
+
+  // PDF 2.7/2.8/2.9/2.10/2.14: TODOS estos broadcasts se disparan también
+  // "si el estado fue cambiado por algún dispositivo de entrada
+  // (multiMaus)", no solo cuando lo pide la app Z21 — por eso se compara
+  // contra el estado anterior aquí y se avisa al núcleo vía changeCb_.
+  // Antes de esto, un cambio de la MultiMaus (o un corto real en la vía)
+  // nunca llegaba a los clientes Z21 conectados por WiFi.
+  if (!changeCb_) return;
+  if (prev.powerOn != track_.powerOn) {
+    changeCb_({track_.powerOn ? TractionEventType::TrackPowerOn : TractionEventType::TrackPowerOff, 0, 0});
+  }
+  if (!prev.emergencyStop && track_.emergencyStop) { // solo al ACTIVARSE, ver PDF 2.14
+    changeCb_({TractionEventType::EmergencyStop, 0, 0});
+  }
+  if (prev.shortCircuit != track_.shortCircuit && track_.shortCircuit) {
+    changeCb_({TractionEventType::ShortCircuit, 0, 0});
+  }
+  if (!prev.serviceModeActive && track_.serviceModeActive) {
+    changeCb_({TractionEventType::ProgrammingMode, 0, 0});
+  }
 }
 
 void XpressNetTractionBackend::onLokAll(uint8_t adrHigh, uint8_t adrLow, bool busy,
@@ -300,12 +378,41 @@ void XpressNetTractionBackend::onLokAll(uint8_t adrHigh, uint8_t adrLow, bool bu
   loco->f13to20 = f2;        // F2: F20..F13, idéntico a DB6
   loco->f21to28 = f3;        // F3: F28..F21, idéntico a DB7
   loco->pendingBusConfirmation = false;
+
+  // PDF 4.4: LAN_X_LOCO_INFO se manda sin pedirlo "si el estado de la
+  // locomotora fue cambiado por uno de los (otros) clientes o mandos" —
+  // esto incluye tanto la MultiMaus como la confirmación real de un
+  // comando que mandamos nosotros mismos (ver setLocoDrive():
+  // pendingBusConfirmation). En ambos casos el núcleo Z21 necesita
+  // enterarse para reenviarlo; mega_z21.ino decide a quién excluir.
+  if (changeCb_) changeCb_({TractionEventType::LocoChanged, addr, 0});
 }
 
 void XpressNetTractionBackend::onTrnt(uint8_t adrHigh, uint8_t adrLow, uint8_t pos) {
   uint16_t addr = ((uint16_t)adrHigh << 8) | adrLow; // sin enmascarar, ver setTurnout()
   AccessoryState *acc = accessories_.findOrAlloc(addr);
   acc->position = static_cast<AccessoryPosition>(pos & 0x03);
+  // PDF 5.3: mismo razonamiento que onLokAll() de arriba, para agujas.
+  if (changeCb_) changeCb_({TractionEventType::TurnoutChanged, addr, 0});
+}
+
+void XpressNetTractionBackend::onCVResult(uint8_t cvAdr, uint8_t cvData) {
+  cvPending_ = false;
+  // cvAdr aquí es el mismo 'byte CV' 0-255 que se mandó a readCVMode/
+  // writeCVMode (ver cvRead()/cvWrite()) — mega_z21.ino lo reconstruye
+  // como CV Z21 (CVAdr_MSB=0, CVAdr_LSB=cvAdr) al construir LAN_X_CV_RESULT.
+  if (changeCb_) changeCb_({TractionEventType::CvResult, cvAdr, cvData});
+}
+
+void XpressNetTractionBackend::onCVInfo(uint8_t state) {
+  // Ver punto 7b de "ASUNCIONES A VALIDAR" en traction_backend_
+  // xpressnet.h: el significado exacto de 'state' no está documentado
+  // más allá del nombre de la función. De momento NO se interpreta como
+  // NACK aquí a propósito (evitar un falso NACK antes de confirmar el
+  // significado real contra hardware) — el único mecanismo de "no dejar
+  // la app colgada" es el timeout de cvPending_ en poll().
+  (void)state; // TODO: revisar contra hardware real y decidir si esto
+               // debe traducirse a CvNack o a otra cosa.
 }
 
 // ---------------------------------------------------------------------
@@ -336,6 +443,18 @@ void notifyLokAll(uint8_t Adr_High, uint8_t Adr_Low, boolean Busy, uint8_t Steps
 void notifyTrnt(uint8_t Adr_High, uint8_t Adr_Low, uint8_t Pos) {
   if (g_activeXpressNetBackend) {
     g_activeXpressNetBackend->onTrnt(Adr_High, Adr_Low, Pos);
+  }
+}
+
+void notifyCVResult(uint8_t cvAdr, uint8_t cvData) {
+  if (g_activeXpressNetBackend) {
+    g_activeXpressNetBackend->onCVResult(cvAdr, cvData);
+  }
+}
+
+void notifyCVInfo(uint8_t State) {
+  if (g_activeXpressNetBackend) {
+    g_activeXpressNetBackend->onCVInfo(State);
   }
 }
 

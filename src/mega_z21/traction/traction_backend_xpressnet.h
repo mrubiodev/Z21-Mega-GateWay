@@ -126,6 +126,56 @@
  *      vuelta al cliente LAN, así que esta limitación no se nota desde
  *      el punto de vista del protocolo — solo desde el punto de vista de
  *      "¿de verdad se mueve algo en la vía?", que aquí es que no.
+ *   7) PROGRAMACIÓN DE CVs (cvRead()/cvWrite(), LAN_X_CV_READ/WRITE, PDF
+ *      sección 6) — dos limitaciones/asunciones SIN confirmar contra
+ *      hardware real:
+ *      a) La librería solo expone readCVMode(byte CV)/writeCVMode(byte
+ *         CV, byte Data) — un CV de 1 byte (0-255), es decir CV1-CV256
+ *         únicamente (la propia librería no tiene ningún equivalente de
+ *         'word CV' ni de POM/"Programming on the Main", a diferencia de
+ *         otros forks como MDRRC/XpressNet). cvRead()/cvWrite() rechazan
+ *         (return false) cualquier CV Z21 >255 ANTES de tocar el bus —
+ *         eso se traduce en mega_z21.ino como un LAN_X_CV_NACK
+ *         inmediato. LAN_X_CV_POM_* (PDF 6.6-6.11) NO tiene equivalente
+ *         posible con esta librería tal cual: no se implementa.
+ *      b) CONFIRMADO contra el código fuente real de la librería (no solo
+ *         su cabecera, que es lo único que se pudo revisar al escribir la
+ *         primera versión de este comentario): readCVMode() ya llama a
+ *         getresultCV() UNA VEZ internamente nada más mandar la petición
+ *         de lectura — la llamada repetida a XpressNet.getresultCV()
+ *         desde poll() (ver cvPending_ más abajo) es un refuerzo/red de
+ *         seguridad para el caso de que la MultiMaus tarde en tener listo
+ *         el resultado (programar en vía de programación puede tardar un
+ *         par de segundos), no algo estrictamente necesario para el
+ *         camino feliz.
+ *         MUCHO MÁS IMPORTANTE — writeCVMode() en absoluto espera
+ *         confirmación real del bus: manda el paquete de escritura y
+ *         acto seguido llama a notifyCVResult(CV, Data) DE FORMA
+ *         SÍNCRONA, con los mismos CV/Data que se le pidieron escribir —
+ *         es decir, "éxito" fabricado en el momento, no una confirmación
+ *         de que el decodificador físico lo haya recibido ni de que lo
+ *         haya aceptado. cvWrite()/cvRead() en el .cpp ya tienen en
+ *         cuenta ESTE orden síncrono (cvPending_ y pendingCvClientId en
+ *         mega_z21.ino se fijan ANTES de llamar a la librería, no
+ *         después — de lo contrario el resultado síncrono se pierde o,
+ *         peor, cvPending_ queda atascado en true para siempre). Efecto
+ *         práctico para las pruebas: un LAN_X_CV_RESULT "positivo" de
+ *         este firmware NO garantiza que el decodificador realmente
+ *         cambiara ese CV — solo garantiza que el comando se mandó al
+ *         bus. Si se necesita saber de verdad si el decodificador
+ *         aceptó el cambio, hay que comprobarlo aparte (p.ej. leyendo el
+ *         mismo CV después, con LAN_X_CV_READ, que sí es asíncrono de
+ *         verdad).
+ *      c) El significado exacto de los distintos valores de 'state' en
+ *         notifyCVInfo() (que SÍ es puramente asíncrono, a diferencia de
+ *         notifyCVResult() en la escritura) NO está documentado en el
+ *         header de la librería más allá del nombre de la función — se
+ *         loguea tal cual (ver onCVInfo() en el .cpp) pero NO se usa
+ *         para decidir nada todavía; el único mecanismo de "no dejar la
+ *         app colgada" en LAN_X_CV_READ es el timeout de cvPending_.
+ *         Revisar aquí primero si, al probar contra la MultiMaus real,
+ *         el resultado de una lectura de CV no llega nunca o llega con
+ *         datos que no cuadran.
  */
 #ifndef TRACTION_BACKEND_XPRESSNET_H
 #define TRACTION_BACKEND_XPRESSNET_H
@@ -165,6 +215,17 @@ public:
   void emergencyStopAll() override;
   TrackState getTrackState() const override;
 
+  void setChangeCallback(TractionChangeCallback cb) override { changeCb_ = cb; }
+
+  // Ver "ASUNCIONES A VALIDAR", punto 7 (más abajo): la librería solo
+  // admite CV como 'byte' (0-255), así que esta v1 solo cubre CV1-CV256
+  // — direcciones Z21 más altas se rechazan devolviendo false ANTES de
+  // tocar el bus. Además, la librería exige llamar a getresultCV() para
+  // que el resultado llegue por notifyCVResult/notifyCVInfo (no es
+  // automático) — ver poll() y el temporizador cvPending_ más abajo.
+  bool cvRead(uint16_t cvAddress) override;
+  bool cvWrite(uint16_t cvAddress, uint8_t value) override;
+
   void setLocoDrive(uint16_t addr, uint8_t stepsCode, uint8_t speedByte) override;
   void setLocoFunction(uint16_t addr, uint8_t index, FunctionOp op) override;
   void setLocoFunctionGroup(uint16_t addr, FunctionGroup group, uint8_t value) override;
@@ -194,12 +255,23 @@ public:
                 uint8_t speed, uint8_t direction, uint8_t f0, uint8_t f1,
                 uint8_t f2, uint8_t f3, bool req);
   void onTrnt(uint8_t adrHigh, uint8_t adrLow, uint8_t pos);
+  void onCVResult(uint8_t cvAdr, uint8_t cvData);
+  void onCVInfo(uint8_t state);
 
 private:
   TrackState track_;
   LocoStateStore locos_;
   AccessoryStateStore accessories_;
   ExtAccessoryStateStore extAccessories_;
+  TractionChangeCallback changeCb_ = nullptr;
+
+  // CV pendiente de resultado (ver punto 7 de "ASUNCIONES A VALIDAR"):
+  // mientras cvPending_ es true, poll() llama a XpressNet.getresultCV()
+  // cada CV_POLL_INTERVAL_MS y, si no llega nada en CV_TIMEOUT_MS, se
+  // sintetiza un CvNack para no dejar a la app esperando para siempre.
+  bool cvPending_ = false;
+  unsigned long cvRequestStartMs_ = 0;
+  unsigned long lastCvPollMs_ = 0;
 };
 
 // Única instancia posible: la librería XpressNetClass usa un puntero
